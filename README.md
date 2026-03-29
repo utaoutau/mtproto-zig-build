@@ -56,6 +56,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 > **Layer 3 -- DC Relay** &nbsp; The proxy connects to the target Telegram datacenter (DC1-DC5), performs its own obfuscated handshake, and relays traffic between client and DC with re-encryption.
 
+> **Anti-censorship -- Masking** &nbsp; When an unauthenticated client connects (e.g. a DPI active probe), the proxy transparently forwards the connection to the real `tls_domain` (e.g. `wb.ru`). The prober receives a genuine TLS certificate and HTTP response, making the proxy indistinguishable from a real web server.
+
 ## &nbsp; Quick Start
 
 ### Prerequisites
@@ -96,6 +98,8 @@ zig build test
 | `make test` | Run unit tests |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format all Zig source files |
+| `make deploy` | Cross-compile, upload to VPS, restart service |
+| `make deploy SERVER=<ip>` | Deploy to a specific server |
 
 </details>
 
@@ -251,6 +255,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` |
+| `[censorship]` | `fast_mode` | `false` | Skip S2C re-encryption (experimental, requires DC support) |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 
 </details>
@@ -269,6 +274,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | Anti-replay | Embedded timestamp validation rejects handshakes outside +/- 2 min window |
 | Nonce validation | Rejects nonces matching HTTP, plain MTProto, or TLS patterns |
 | Dynamic Record Sizing | TLS record sizes mimic real browsers, preventing traffic fingerprinting |
+| Connection masking | Invalid clients are proxied to the real `tls_domain`, defeating DPI active probes |
 | Systemd hardening | Runs as unprivileged user with `NoNewPrivileges`, `ProtectSystem=strict` |
 
 ## &nbsp; Project Structure
@@ -293,6 +299,17 @@ bob   = "ffeeddccbbaa99887766554433221100"
     └── proxy/
         └── proxy.zig             TCP listener, connection handler, relay, DRS
 ```
+
+## &nbsp; iOS Compatibility
+
+The proxy includes specific handling for iOS Telegram clients:
+
+- **Fragmented handshake assembly** — iOS may split the 64-byte MTProto handshake across multiple TLS AppData records or interleave CCS records
+- **Two-stage timeouts** — idle pool connections (common on iOS) get a generous 5-minute poll timeout; active data gets a tight 10s `SO_RCVTIMEO`
+- **Generous handshake timeout** — 60s timeout during handshake assembly (iOS may delay after ServerHello)
+- **Fixed record sizing** — TLS records are kept at MSS-sized 1369 bytes for maximum compatibility
+
+> **Important** &nbsp; Many Russian ISPs (via TSPU/DPI) block known VPS IP ranges at the network level. If the proxy appears to connect but the app stays on "Updating...", try a server in a different country/provider. The `mask = true` setting helps prevent your IP from being flagged in the first place.
 
 ## &nbsp; License
 
