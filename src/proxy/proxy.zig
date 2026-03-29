@@ -71,22 +71,17 @@ const DynamicRecordSizer = struct {
     }
 
     /// Get the max payload size for the next TLS record.
+    /// COMPATIBILITY: Fixed at initial_size (1369) for iOS compatibility testing.
+    /// Large records (16384) may cause issues with some clients.
     fn nextRecordSize(self: *DynamicRecordSizer) usize {
-        return self.current_size;
+        _ = self;
+        return initial_size;
     }
 
-    /// Report that a record was sent. Handles ramp-up logic.
+    /// Report that a record was sent. Ramp-up disabled for compatibility testing.
     fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
-        self.records_sent += 1;
-        self.bytes_sent += payload_len;
-
-        if (self.current_size < full_size) {
-            if (self.records_sent >= ramp_record_threshold or
-                self.bytes_sent >= ramp_byte_threshold)
-            {
-                self.current_size = full_size;
-            }
-        }
+        _ = self;
+        _ = payload_len;
     }
 };
 
@@ -234,8 +229,12 @@ fn handleConnectionInner(
         return error.IdleConnectionClosed;
     }
 
-    // Stage 2: data is coming — apply tight recv timeout (anti-Slowloris)
-    setRecvTimeout(fd, active_timeout_sec);
+    // Stage 2: data is coming — apply generous handshake timeout.
+    // DON'T use the tight 10s timeout yet — iOS Telegram may delay the
+    // MTProto handshake after ServerHello (pool warming, timing differences).
+    // Tight timeout is applied after the full 64-byte handshake is assembled.
+    const handshake_timeout_sec: u32 = 60;
+    setRecvTimeout(fd, handshake_timeout_sec);
 
     // Read first 5 bytes to determine TLS vs direct
     var first_bytes: [5]u8 = undefined;
@@ -287,35 +286,73 @@ fn handleConnectionInner(
 
     try writeAll(client_stream, server_hello);
 
-    // Read 64-byte MTProto handshake (wrapped in TLS Application Data)
-    // The client may send a Change Cipher Spec (CCS) record first — skip it.
-    var tls_header: [5]u8 = undefined;
-    while (true) {
+    // Assemble the 64-byte MTProto handshake from potentially multiple TLS AppData records.
+    // iOS Telegram may split the handshake across records or interleave CCS records.
+    // Desktop typically sends all 64 bytes in one AppData record, but we must not assume that.
+    var handshake_assembly: [constants.handshake_len]u8 = undefined;
+    var hs_pos: usize = 0;
+    var pipelined_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
+    var pipelined_len: usize = 0;
+    var app_records_used: u8 = 0;
+
+    while (hs_pos < constants.handshake_len) {
+        var tls_header: [5]u8 = undefined;
         if (try readExact(client_stream, &tls_header) < 5) return;
 
-        if (tls_header[0] == constants.tls_record_application) break;
+        const record_type = tls_header[0];
+        const body_len = std.mem.readInt(u16, tls_header[3..5], .big);
 
-        if (tls_header[0] == constants.tls_record_change_cipher) {
-            // Read and discard the CCS body
-            const ccs_len = std.mem.readInt(u16, tls_header[3..5], .big);
-            if (ccs_len > 256) return;
-            var ccs_buf: [256]u8 = undefined;
-            if (try readExact(client_stream, ccs_buf[0..ccs_len]) < ccs_len) return;
-            continue;
+        switch (record_type) {
+            constants.tls_record_change_cipher => {
+                // Read and discard CCS body
+                if (body_len > 256) return;
+                var ccs_buf: [256]u8 = undefined;
+                if (try readExact(client_stream, ccs_buf[0..body_len]) < body_len) return;
+            },
+            constants.tls_record_application => {
+                if (body_len == 0 or body_len > constants.max_tls_ciphertext_size) return;
+                var body_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
+                if (try readExact(client_stream, body_buf[0..body_len]) < body_len) return;
+
+                app_records_used += 1;
+
+                const need = constants.handshake_len - hs_pos;
+                const take = @min(need, body_len);
+
+                @memcpy(handshake_assembly[hs_pos..][0..take], body_buf[0..take]);
+                hs_pos += take;
+
+                // Any extra bytes beyond the 64-byte handshake are pipelined data
+                if (body_len > take) {
+                    const extra = body_len - take;
+                    @memcpy(pipelined_buf[0..extra], body_buf[take..][0..extra]);
+                    pipelined_len = extra;
+                }
+            },
+            constants.tls_record_alert => {
+                // Log alert details before bailing — helps diagnose iOS rejections
+                if (body_len >= 2 and body_len <= 256) {
+                    var alert_buf: [256]u8 = undefined;
+                    if (try readExact(client_stream, alert_buf[0..body_len]) >= 2) {
+                        log.info("[{d}] ({s}) TLS Alert during handshake: level={d} desc={d}", .{
+                            conn_id, peer_str, alert_buf[0], alert_buf[1],
+                        });
+                    }
+                }
+                return;
+            },
+            else => {
+                log.debug("[{d}] ({s}) Unexpected TLS record type after ServerHello: 0x{x:0>2}", .{ conn_id, peer_str, record_type });
+                return;
+            },
         }
-
-        log.debug("[{d}] ({s}) Unexpected TLS record type after ServerHello: 0x{x:0>2}", .{ conn_id, peer_str, tls_header[0] });
-        return;
     }
 
-    const payload_len = std.mem.readInt(u16, tls_header[3..5], .big);
-    if (payload_len < constants.handshake_len) return;
-    if (payload_len > constants.max_tls_ciphertext_size) return; // Fix #4: bounds check against buffer size
+    log.debug("[{d}] ({s}) MTProto handshake assembled from {d} AppData record(s), pipelined={d}B", .{
+        conn_id, peer_str, app_records_used, pipelined_len,
+    });
 
-    var payload_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
-    if (try readExact(client_stream, payload_buf[0..payload_len]) < payload_len) return;
-
-    const handshake: *const [constants.handshake_len]u8 = payload_buf[0..constants.handshake_len];
+    const handshake: *const [constants.handshake_len]u8 = &handshake_assembly;
 
     // Parse obfuscation params
     const result = obfuscation.ObfuscationParams.fromHandshake(handshake, state.user_secrets) orelse {
@@ -429,21 +466,19 @@ fn handleConnectionInner(
     // counter 0 — we must advance it by 4 to match the client's CTR state.
     client_decryptor.ctr +%= 4;
 
-    // Fix #3: Handle pipelined data — Telegram clients send their first RPC request
+    // Fix #3: Handle pipelined data — Telegram clients may send their first RPC request
     // immediately after the 64-byte handshake in the same TLS record. If we don't
     // forward these bytes, the client's first message is silently lost.
     var initial_c2s_bytes: u64 = 0;
 
-    if (payload_len > constants.handshake_len) {
-        const pipelined = payload_buf[constants.handshake_len..payload_len];
+    if (pipelined_len > 0) {
+        const pipelined = pipelined_buf[0..pipelined_len];
         log.debug("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
         // Decrypt with client cipher, re-encrypt with DC cipher
         client_decryptor.apply(pipelined);
         tg_encryptor.apply(pipelined);
         try writeAll(dc_stream, pipelined);
         initial_c2s_bytes = pipelined.len;
-    } else {
-        log.debug("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
     }
 
     relayBidirectional(
@@ -651,8 +686,6 @@ fn relayClientToDc(
     bytes_counter: *u64,
     conn_id: u64,
 ) !RelayProgress {
-    _ = conn_id;
-
     var consumed_any = false;
 
     // Read as much as possible in this call
@@ -676,7 +709,15 @@ fn relayClientToDc(
             const record_type = tls_hdr_buf[0];
 
             if (record_type == constants.tls_record_alert) {
-                // Alert = peer closing
+                // Try to read alert body for diagnostic logging (best-effort, non-blocking)
+                const alert_body_len = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+                if (alert_body_len >= 2 and alert_body_len <= 256) {
+                    var alert_buf: [256]u8 = undefined;
+                    const ar = client.read(alert_buf[0..alert_body_len]) catch 0;
+                    if (ar >= 2) {
+                        log.info("[{d}] C2S TLS Alert: level={d} desc={d}", .{ conn_id, alert_buf[0], alert_buf[1] });
+                    }
+                }
                 return error.ConnectionReset;
             }
 
@@ -933,27 +974,15 @@ test "ProxyState init/deinit" {
     try std.testing.expectEqual(@as(usize, 1), state.user_secrets.len);
 }
 
-test "DRS starts small and ramps up" {
+test "DRS always returns fixed size (compatibility mode)" {
     var drs = DynamicRecordSizer.init();
 
-    // Initially should use small records
+    // Should always use small records (compatibility mode)
     try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
 
-    // Send a few records — should stay small
-    for (0..DynamicRecordSizer.ramp_record_threshold - 1) |_| {
+    // After many records, still small
+    for (0..100) |_| {
         drs.recordSent(1369);
     }
     try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
-
-    // One more should trigger ramp-up
-    drs.recordSent(1369);
-    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
-}
-
-test "DRS ramps up by byte threshold" {
-    var drs = DynamicRecordSizer.init();
-
-    // Send fewer records but enough bytes to trigger ramp
-    drs.recordSent(DynamicRecordSizer.ramp_byte_threshold);
-    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
