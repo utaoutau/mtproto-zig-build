@@ -28,6 +28,13 @@ const idle_timeout_ms: i32 = 5 * 60 * 1000;
 /// Active Phase: once data starts arriving, apply tight SO_RCVTIMEO
 /// to protect against Slowloris-style attacks (seconds).
 const active_timeout_sec: u32 = 10;
+/// Maximum connection lifetime (30 minutes). Hard cap to prevent thread
+/// accumulation from long-lived connections or half-open sockets that
+/// somehow survive keepalive probes.
+const max_connection_lifetime_ms: i64 = 30 * 60 * 1000;
+/// Send timeout (seconds). Prevents writeAll from hanging indefinitely
+/// on a dead peer whose kernel buffer isn't full.
+const send_timeout_sec: u32 = 30;
 
 // ============= Dynamic Record Sizing (DRS) =============
 
@@ -319,7 +326,7 @@ fn handleConnectionInner(
     var params = result.params;
     defer params.wipe();
 
-    log.info("[{d}] ({s}) MTProto OK: user={s} dc={d} proto={any}", .{
+    log.debug("[{d}] ({s}) MTProto OK: user={s} dc={d} proto={any}", .{
         conn_id,
         peer_str,
         result.user,
@@ -328,7 +335,7 @@ fn handleConnectionInner(
     });
 
     // Diagnostic: log client cipher details
-    log.info("[{d}] ({s}) Client dec_iv=0x{x:0>32} enc_iv=0x{x:0>32}", .{
+    log.debug("[{d}] ({s}) Client dec_iv=0x{x:0>32} enc_iv=0x{x:0>32}", .{
         conn_id,                      peer_str,
         @as(u128, params.decrypt_iv), @as(u128, params.encrypt_iv),
     });
@@ -344,7 +351,7 @@ fn handleConnectionInner(
     if (dc_idx >= constants.tg_datacenters_v4.len) return;
 
     const dc_addr = constants.tg_datacenters_v4[dc_idx];
-    log.info("[{d}] ({s}) Connecting to DC {d}", .{ conn_id, peer_str, params.dc_idx });
+    log.debug("[{d}] ({s}) Connecting to DC {d}", .{ conn_id, peer_str, params.dc_idx });
 
     const dc_stream = net.tcpConnectToAddress(dc_addr) catch |err| {
         log.err("[{d}] ({s}) DC connect failed: {any}", .{ conn_id, peer_str, err });
@@ -399,8 +406,12 @@ fn handleConnectionInner(
 
     log.info("[{d}] ({s}) Relaying traffic", .{ conn_id, peer_str });
 
-    // Set both sockets to non-blocking to prevent deadlocks with poll().
-    // The relay handlers already handle WouldBlock errors correctly.
+    // Configure both sockets for robust relay:
+    // - TCP keepalive: detect dead peers (half-open connections) within ~90s
+    // - SO_SNDTIMEO: prevent writeAll from hanging on dead peers
+    // - Non-blocking: prevent deadlocks with poll()
+    configureRelaySocket(client_stream.handle);
+    configureRelaySocket(dc_stream.handle);
     setNonBlocking(client_stream.handle);
     setNonBlocking(dc_stream.handle);
 
@@ -425,14 +436,14 @@ fn handleConnectionInner(
 
     if (payload_len > constants.handshake_len) {
         const pipelined = payload_buf[constants.handshake_len..payload_len];
-        log.info("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
+        log.debug("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
         // Decrypt with client cipher, re-encrypt with DC cipher
         client_decryptor.apply(pipelined);
         tg_encryptor.apply(pipelined);
         try writeAll(dc_stream, pipelined);
         initial_c2s_bytes = pipelined.len;
     } else {
-        log.info("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
+        log.debug("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
     }
 
     relayBidirectional(
@@ -499,6 +510,11 @@ fn relayBidirectional(
     var poll_iterations: u64 = 0;
     var no_progress_polls: u32 = 0;
 
+    // Connection lifetime tracking — hard cap to prevent thread accumulation.
+    // Even with TCP keepalive, a legitimate but rarely-active connection could
+    // keep a thread alive indefinitely. Cap at 30 minutes.
+    const start_ts = std.time.milliTimestamp();
+
     while (true) {
         fds[0].revents = 0;
         fds[1].revents = 0;
@@ -510,6 +526,17 @@ fn relayBidirectional(
         }
 
         poll_iterations += 1;
+
+        // Hard lifetime cap: force-close connections older than max_connection_lifetime_ms.
+        // Prevents thread accumulation from long-lived or stuck connections.
+        const elapsed = std.time.milliTimestamp() - start_ts;
+        if (elapsed > max_connection_lifetime_ms) {
+            log.info("[{d}] Relay: max lifetime reached ({d}ms), c2s={d} s2c={d}", .{
+                conn_id, elapsed, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+
         var progressed = false;
 
         const client_revents = fds[0].revents;
@@ -846,6 +873,45 @@ fn setNonBlocking(fd: posix.fd_t) void {
 fn setRecvTimeout(fd: posix.fd_t, timeout_sec: u32) void {
     const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
+}
+
+/// Set SO_SNDTIMEO on a socket to prevent write hangs on dead peers.
+fn setSendTimeout(fd: posix.fd_t, timeout_sec: u32) void {
+    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
+}
+
+/// Enable TCP keepalive to detect dead peers (half-open connections).
+/// Without this, a peer that disappears without sending FIN leaves our
+/// thread stuck in poll() for up to relay_timeout_ms (5 minutes). With
+/// keepalive, the OS probes the connection and delivers an error within
+/// ~90 seconds (60s idle + 3 probes * 10s interval).
+fn setTcpKeepalive(fd: posix.fd_t) void {
+    // SOL.TCP = 6 (IPPROTO_TCP), not in posix.SOL — use raw value
+    const sol_tcp: i32 = 6;
+
+    // Enable SO_KEEPALIVE at the socket level
+    const enable: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&enable)) catch return;
+
+    // Start probing after 60 seconds idle
+    const idle: c_int = 60;
+    posix.setsockopt(fd, sol_tcp, 4, std.mem.asBytes(&idle)) catch return; // TCP_KEEPIDLE
+
+    // Probe every 10 seconds
+    const interval: c_int = 10;
+    posix.setsockopt(fd, sol_tcp, 5, std.mem.asBytes(&interval)) catch return; // TCP_KEEPINTVL
+
+    // 3 failed probes = connection dead
+    const count: c_int = 3;
+    posix.setsockopt(fd, sol_tcp, 6, std.mem.asBytes(&count)) catch return; // TCP_KEEPCNT
+}
+
+/// Configure a relay socket with keepalive + send timeout.
+/// Applied to both client and DC sockets before entering the relay loop.
+fn configureRelaySocket(fd: posix.fd_t) void {
+    setTcpKeepalive(fd);
+    setSendTimeout(fd, send_timeout_sec);
 }
 
 test "ProxyState init/deinit" {

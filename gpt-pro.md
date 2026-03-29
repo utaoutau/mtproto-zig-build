@@ -1,574 +1,421 @@
-You’re very close. I think you have **one instrumentation problem** and **three real I/O bugs**.
+## Bottom line
 
-## My read
+I don’t think your remaining blocker is the global crypto anymore.
 
-### Highest-probability immediate CPU cause
-Your new **hot-path hex logging** is very likely the thing pushing CPU to 95%+.
+**Mac working at MB scale is very strong evidence that:**
+- FakeTLS auth is basically correct,
+- the client↔proxy and proxy↔DC key derivation is basically correct,
+- the relay loop is no longer fundamentally broken.
 
-Why:
-- formatting `[]u8` as hex in `ReleaseFast` on every relay packet is expensive;
-- under systemd/journald, logs can be **rate-limited or dropped**, so you pay formatting cost but don’t necessarily see output;
-- that matches “CPU high, many threads, no relay diagnostics visible”.
+So the remaining iPhone issue is most likely in the **connection lifecycle right after `ServerHello`**, not in `buildServerHello()` or the core CTR formulas.
 
-So I would treat the logging as the **amplifier**.
+## Most likely root cause
 
-### Real correctness bugs I would fix right now
-1. **You ignore partial writes** for:
-   - `client_stream.write(server_hello)`
-   - `dc_stream.write(&nonce_to_send)`
+Your code still makes this desktop-friendly assumption:
 
-   That is a real bug even if it only triggers occasionally.
+> **After `ServerHello`, the first TLS Application Data record arrives quickly, and it contains the full 64-byte MTProto obfuscation handshake, optionally followed by pipelined data.**
 
-2. **`POLLHUP` is handled too early** in `relayBidirectional()`.
-   On Linux, `poll()` commonly returns `POLLIN | POLLHUP` when the peer has sent final bytes and then closed.
-   Your code exits **before draining readable bytes**.
+That assumption is here:
 
-3. **Your “spin detector” only counts forwarded bytes**, not partial parser progress.
-   So a connection that is slowly assembling a TLS record can look like “no progress”.
+```zig
+const payload_len = std.mem.readInt(u16, tls_header[3..5], .big);
+if (payload_len < constants.handshake_len) return;
+...
+const handshake: *const [constants.handshake_len]u8 = payload_buf[0..constants.handshake_len];
+```
 
-4. Minor but important: your `c2s=0` logs are misleading because **pipelined bytes are not counted** in `c2s_bytes`.
+and it is combined with this:
+
+```zig
+setRecvTimeout(fd, active_timeout_sec); // 10s
+```
+
+which is applied **before**:
+- finishing the TLS bootstrap,
+- receiving the client’s MTProto obfuscated handshake,
+- and before you know whether the socket is a real session or just an iOS warmed connection.
+
+### Why this matches the symptoms
+
+- **iPhone proxy settings show “Connected”**  
+  So FakeTLS auth and at least one minimal round-trip are fine.
+
+- **Mac fully works**  
+  So your universal crypto path is not globally wrong.
+
+- **iPhone opens lots of idle/warmed connections**  
+  That means its timing/fragmentation behavior is different from Desktop.
+
+- **Some iPhone connections exchange tens of KB but never become real sessions**  
+  That’s exactly what you’d expect if:
+  - proxy test / lightweight channels work,
+  - but the main pooled session connections are being dropped or malformed during the post-ServerHello bootstrap.
 
 ---
 
-## What I would change first
+## What I think is happening
 
-### 1) Stop doing packet hex dumps in the hot path
-Do not use `std.log` with big `{x}` slice formatting per packet.
+### 1. You start the “active” timeout too early
+Right now the $10$s timeout starts after the **first byte** of the TCP connection.
 
-If you still need tracing, do **bounded previews only**, and only for **one connection / one IP / first packet per direction**.
+For Desktop that’s fine because it usually does the whole sequence promptly.
+
+For iOS, that is too early. iOS is much more likely to:
+- pre-open a connection,
+- send ClientHello,
+- validate proxy reachability,
+- then delay the first MTProto AppData,
+- or split it differently.
+
+So you’re likely killing some of the connections iOS actually intends to reuse.
+
+---
+
+### 2. You require the initial MTProto handshake to fit in one TLS AppData record
+That is not guaranteed.
+
+If iPhone splits the first $64$ obfuscated bytes across two TLS Application Data records, your code silently drops the connection.
+
+Desktop may happen to put those $64$ bytes in one record often enough that you never noticed.
+
+This is the **single most concrete code-level incompatibility** still in the handshake path.
+
+---
+
+### 3. Your remaining S2C shaping may still be too aggressive for iOS
+I do **not** think this is the first thing to fix, but it is the next suspect after handshake-lifecycle issues.
+
+Your `DynamicRecordSizer` ramps to $16384$-byte TLS records. Desktop likely doesn’t care. iOS may be less happy with large fake-TLS records, especially early in a connection.
+
+Even if the client *should* tolerate them, your current goal is compatibility, not elegance.
+
+---
+
+## What I would fix first
+
+# 1) Don’t arm the 10s timeout until after the full MTProto handshake is assembled
+
+For a first production fix, simplest is:
+
+- keep the long idle tolerance through:
+  - ClientHello,
+  - ServerHello,
+  - CCS,
+  - and until you have the full $64$-byte MTProto obfuscation handshake.
+- only then proceed into the non-blocking relay.
+
+For testing, I would even temporarily remove the 10s recv timeout from the handshake phase entirely.
+
+### Why
+Because the current timeout policy is iOS-hostile *specifically* in the place where iOS behaves differently from Desktop.
+
+---
+
+# 2) Assemble the 64-byte MTProto handshake across multiple TLS AppData records
+
+This is the main concrete patch.
+
+Instead of:
+
+```zig
+if (payload_len < constants.handshake_len) return;
+const handshake: *const [constants.handshake_len]u8 = payload_buf[0..constants.handshake_len];
+```
+
+you want:
+
+- skip CCS records,
+- read AppData records until you have exactly $64$ bytes of obfuscated handshake,
+- keep any extra bytes from the record that completed the $64$ bytes as pipelined payload.
+
+That makes the proxy robust to iOS fragmentation without changing your crypto.
+
+---
+
+# 3) Temporarily disable DRS ramp for compatibility testing
+
+For now, keep S2C TLS records fixed and small:
+- either `1369`,
+- or `4096`.
+
+Do **not** ramp to `16384` until iPhone works.
+
+This is a compatibility simplifier, not a proven root cause.
+
+---
+
+## Minimal patch direction
 
 <details>
-<summary>Safe preview helper</summary>
+<summary>Patch sketch for initial MTProto handshake assembly</summary>
 
 ```zig
-const trace_packets = false;
+const handshake_timeout_sec: u32 = 60;
 
-fn logPreview(comptime label: []const u8, conn_id: u64, data: []const u8) void {
-    if (!trace_packets) return;
-
-    const n = @min(data.len, 32);
-    var out: [95]u8 = undefined; // 32 bytes => 64 hex + 31 spaces
-    var pos: usize = 0;
-    const hex = "0123456789abcdef";
-
-    for (data[0..n], 0..) |b, i| {
-        if (i != 0) {
-            out[pos] = ' ';
-            pos += 1;
-        }
-        out[pos] = hex[b >> 4];
-        out[pos + 1] = hex[b & 0x0f];
-        pos += 2;
-    }
-
-    log.debug("[{d}] {s}: len={d} first={s}", .{
-        conn_id,
-        label,
-        data.len,
-        out[0..pos],
-    });
-}
-```
-
-</details>
-
-Also: for production, I would not keep global release logging at `.debug`. Keep it at `.info`, and make packet tracing an explicit toggle.
-
----
-
-### 2) Use `writeAll()` for `ServerHello` and DC nonce
-This is a must-fix.
-
-```zig
-try writeAll(client_stream, server_hello);
-...
-try writeAll(dc_stream, &nonce_to_send);
-```
-
-Replace these two lines:
-
-```zig
-_ = try client_stream.write(server_hello);
-...
-_ = try dc_stream.write(&nonce_to_send);
-```
-
----
-
-### 3) Make relay progress-aware and drain `POLLIN` before treating `POLLHUP` as fatal
-This is the main relay fix.
-
-Add:
-
-```zig
-const RelayProgress = enum {
-    none,
-    partial,
-    forwarded,
-};
-```
-
-Then replace your relay functions with these versions.
-
-<details>
-<summary><code>relayBidirectional</code>, <code>relayClientToDc</code>, <code>relayDcToClient</code>, <code>writeAll</code></summary>
-
-```zig
-const RelayProgress = enum {
-    none,
-    partial,
-    forwarded,
+const InitialClientHandshake = struct {
+    wire_handshake: [constants.handshake_len]u8,
+    pipelined_len: usize,
+    pipelined_buf: [constants.max_tls_ciphertext_size]u8,
+    app_records_used: u8,
 };
 
-fn relayBidirectional(
-    client: net.Stream,
-    dc: net.Stream,
-    client_decryptor: *crypto.AesCtr,
-    client_encryptor: *crypto.AesCtr,
-    tg_encryptor: *crypto.AesCtr,
-    tg_decryptor: *crypto.AesCtr,
-    initial_c2s_bytes: u64,
-    conn_id: u64,
-) !void {
-    var fds = [2]posix.pollfd{
-        .{ .fd = client.handle, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = dc.handle, .events = posix.POLL.IN, .revents = 0 },
+fn readInitialClientHandshake(stream: net.Stream) !InitialClientHandshake {
+    var out: InitialClientHandshake = .{
+        .wire_handshake = undefined,
+        .pipelined_len = 0,
+        .pipelined_buf = undefined,
+        .app_records_used = 0,
     };
 
-    // State for reading TLS records from client
-    var tls_hdr_buf: [tls_header_len]u8 = undefined;
-    var tls_hdr_pos: usize = 0;
-    var tls_body_buf: [max_tls_payload]u8 = undefined;
-    var tls_body_pos: usize = 0;
-    var tls_body_len: usize = 0;
+    var hs_pos: usize = 0;
+    var tls_header: [5]u8 = undefined;
+    var body_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
 
-    var drs = DynamicRecordSizer.init();
-    var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
+    while (hs_pos < constants.handshake_len) {
+        if (try readExact(stream, &tls_header) < 5) return error.ConnectionReset;
 
-    var c2s_bytes: u64 = initial_c2s_bytes;
-    var s2c_bytes: u64 = 0;
-    var poll_iterations: u64 = 0;
-    var no_progress_polls: u32 = 0;
+        const record_type = tls_header[0];
+        const body_len = std.mem.readInt(u16, tls_header[3..5], .big);
+        if (body_len > constants.max_tls_ciphertext_size) return error.ConnectionReset;
 
-    while (true) {
-        fds[0].revents = 0;
-        fds[1].revents = 0;
-
-        const ready = try posix.poll(&fds, relay_timeout_ms);
-        if (ready == 0) {
-            log.debug("[{d}] Relay: idle timeout, c2s={d} s2c={d}", .{
-                conn_id, c2s_bytes, s2c_bytes,
-            });
-            return error.ConnectionReset;
-        }
-
-        poll_iterations += 1;
-        var progressed = false;
-
-        const client_revents = fds[0].revents;
-        const dc_revents = fds[1].revents;
-
-        // IMPORTANT: drain readable data first. POLLIN|POLLHUP is common on Linux.
-        if ((client_revents & posix.POLL.IN) != 0) {
-            const step = relayClientToDc(
-                client,
-                dc,
-                client_decryptor,
-                tg_encryptor,
-                &tls_hdr_buf,
-                &tls_hdr_pos,
-                &tls_body_buf,
-                &tls_body_pos,
-                &tls_body_len,
-                &c2s_bytes,
-                conn_id,
-            ) catch |err| {
-                log.debug("[{d}] Relay: C2S error: {any}, polls={d} c2s={d} s2c={d}", .{
-                    conn_id, err, poll_iterations, c2s_bytes, s2c_bytes,
-                });
-                return err;
-            };
-            if (step != .none) progressed = true;
-        }
-
-        if ((dc_revents & posix.POLL.IN) != 0) {
-            const step = relayDcToClient(
-                dc,
-                client,
-                tg_decryptor,
-                client_encryptor,
-                &dc_read_buf,
-                &drs,
-                &s2c_bytes,
-            ) catch |err| {
-                log.debug("[{d}] Relay: S2C error: {any}, polls={d} c2s={d} s2c={d}", .{
-                    conn_id, err, poll_iterations, c2s_bytes, s2c_bytes,
-                });
-                return err;
-            };
-            if (step != .none) progressed = true;
-        }
-
-        // Hard errors after draining readable data
-        if ((client_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.debug("[{d}] Relay: client ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
-                conn_id, client_revents, poll_iterations, c2s_bytes, s2c_bytes,
-            });
-            return error.ConnectionReset;
-        }
-        if ((dc_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.debug("[{d}] Relay: DC ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
-                conn_id, dc_revents, poll_iterations, c2s_bytes, s2c_bytes,
-            });
-            return error.ConnectionReset;
-        }
-
-        // If HUP arrived without readable data, close immediately.
-        // If it arrived with POLLIN, we already drained what we could above.
-        if (((client_revents & posix.POLL.HUP) != 0) and ((client_revents & posix.POLL.IN) == 0)) {
-            log.debug("[{d}] Relay: client HUP, polls={d} c2s={d} s2c={d}", .{
-                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
-            });
-            return error.ConnectionReset;
-        }
-        if (((dc_revents & posix.POLL.HUP) != 0) and ((dc_revents & posix.POLL.IN) == 0)) {
-            log.debug("[{d}] Relay: DC HUP, polls={d} c2s={d} s2c={d}", .{
-                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
-            });
-            return error.ConnectionReset;
-        }
-
-        if (!progressed) {
-            no_progress_polls += 1;
-            if (no_progress_polls >= 32) {
-                log.warn("[{d}] Relay: no-progress poll loop, client_revents=0x{x} dc_revents=0x{x} hdr={d} body_pos={d} body_len={d} c2s={d} s2c={d}", .{
-                    conn_id,
-                    client_revents,
-                    dc_revents,
-                    tls_hdr_pos,
-                    tls_body_pos,
-                    tls_body_len,
-                    c2s_bytes,
-                    s2c_bytes,
-                });
-                return error.ConnectionReset;
-            }
-        } else {
-            no_progress_polls = 0;
-        }
-    }
-}
-
-fn relayClientToDc(
-    client: net.Stream,
-    dc: net.Stream,
-    client_decryptor: *crypto.AesCtr,
-    tg_encryptor: *crypto.AesCtr,
-    tls_hdr_buf: *[tls_header_len]u8,
-    tls_hdr_pos: *usize,
-    tls_body_buf: *[max_tls_payload]u8,
-    tls_body_pos: *usize,
-    tls_body_len: *usize,
-    bytes_counter: *u64,
-    conn_id: u64,
-) !RelayProgress {
-    _ = conn_id;
-
-    var consumed_any = false;
-
-    while (true) {
-        if (tls_hdr_pos.* < tls_header_len) {
-            const nr = client.read(tls_hdr_buf[tls_hdr_pos.*..]) catch |err| {
-                if (err == error.WouldBlock) {
-                    return if (consumed_any) .partial else .none;
+        switch (record_type) {
+            constants.tls_record_change_cipher => {
+                if (body_len > 256) return error.ConnectionReset;
+                if (try readExact(stream, body_buf[0..body_len]) < body_len) {
+                    return error.ConnectionReset;
                 }
-                return err;
-            };
-            if (nr == 0) return error.ConnectionReset;
-
-            consumed_any = true;
-            tls_hdr_pos.* += nr;
-
-            if (tls_hdr_pos.* < tls_header_len) return .partial;
-
-            const record_type = tls_hdr_buf[0];
-
-            if (record_type == constants.tls_record_alert) {
-                return error.ConnectionReset;
-            }
-
-            switch (record_type) {
-                constants.tls_record_change_cipher, constants.tls_record_application => {
-                    tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-                    if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
-                        return error.ConnectionReset;
-                    }
-                    tls_body_pos.* = 0;
-                },
-                else => return error.ConnectionReset,
-            }
-        }
-
-        const remaining = tls_body_len.* - tls_body_pos.*;
-        if (remaining == 0) {
-            tls_hdr_pos.* = 0;
-            tls_body_pos.* = 0;
-            tls_body_len.* = 0;
-            if (consumed_any) return .partial;
-            continue;
-        }
-
-        const nr = client.read(tls_body_buf[tls_body_pos.*..][0..remaining]) catch |err| {
-            if (err == error.WouldBlock) {
-                return if (consumed_any) .partial else .none;
-            }
-            return err;
-        };
-        if (nr == 0) return error.ConnectionReset;
-
-        consumed_any = true;
-        tls_body_pos.* += nr;
-
-        if (tls_body_pos.* < tls_body_len.*) return .partial;
-
-        if (tls_hdr_buf[0] == constants.tls_record_change_cipher) {
-            tls_hdr_pos.* = 0;
-            tls_body_pos.* = 0;
-            tls_body_len.* = 0;
-            continue;
-        }
-
-        const payload = tls_body_buf[0..tls_body_len.*];
-
-        client_decryptor.apply(payload);
-        tg_encryptor.apply(payload);
-        try writeAll(dc, payload);
-
-        bytes_counter.* += payload.len;
-
-        tls_hdr_pos.* = 0;
-        tls_body_pos.* = 0;
-        tls_body_len.* = 0;
-        return .forwarded;
-    }
-}
-
-fn relayDcToClient(
-    dc: net.Stream,
-    client: net.Stream,
-    tg_decryptor: *crypto.AesCtr,
-    client_encryptor: *crypto.AesCtr,
-    dc_read_buf: *[constants.default_buffer_size]u8,
-    drs: *DynamicRecordSizer,
-    bytes_counter: *u64,
-) !RelayProgress {
-    const nr = dc.read(dc_read_buf) catch |err| {
-        if (err == error.WouldBlock) return .none;
-        return err;
-    };
-    if (nr == 0) return error.ConnectionReset;
-
-    const data = dc_read_buf[0..nr];
-
-    tg_decryptor.apply(data);
-    client_encryptor.apply(data);
-
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const max_chunk = drs.nextRecordSize();
-        const chunk_len = @min(data.len - offset, max_chunk);
-
-        var hdr: [tls_header_len]u8 = undefined;
-        hdr[0] = constants.tls_record_application;
-        hdr[1] = constants.tls_version[0];
-        hdr[2] = constants.tls_version[1];
-        std.mem.writeInt(u16, hdr[3..5], @intCast(chunk_len), .big);
-
-        try writeAll(client, &hdr);
-        try writeAll(client, data[offset..][0..chunk_len]);
-
-        drs.recordSent(chunk_len);
-        offset += chunk_len;
-    }
-
-    bytes_counter.* += nr;
-    return .forwarded;
-}
-
-fn writeAll(stream: net.Stream, data: []const u8) !void {
-    var written: usize = 0;
-    var wouldblock_spins: u8 = 0;
-
-    while (written < data.len) {
-        const nw = stream.write(data[written..]) catch |err| {
-            if (err == error.WouldBlock) {
-                wouldblock_spins += 1;
-                if (wouldblock_spins >= 32) return error.ConnectionReset;
-
-                var fds = [1]posix.pollfd{
-                    .{ .fd = stream.handle, .events = posix.POLL.OUT, .revents = 0 },
-                };
-
-                const ready = try posix.poll(&fds, relay_timeout_ms);
-                if (ready == 0) return error.ConnectionReset;
-
-                if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) {
+            },
+            constants.tls_record_application => {
+                if (try readExact(stream, body_buf[0..body_len]) < body_len) {
                     return error.ConnectionReset;
                 }
 
-                if ((fds[0].revents & posix.POLL.OUT) == 0) continue;
-                continue;
-            }
-            return err;
-        };
+                out.app_records_used += 1;
 
-        if (nw == 0) return error.ConnectionReset;
+                const need = constants.handshake_len - hs_pos;
+                const take = @min(need, body_len);
 
-        wouldblock_spins = 0;
-        written += nw;
+                @memcpy(out.wire_handshake[hs_pos..][0..take], body_buf[0..take]);
+                hs_pos += take;
+
+                if (body_len > take) {
+                    const extra = body_len - take;
+                    @memcpy(out.pipelined_buf[0..extra], body_buf[take..][0..extra]);
+                    out.pipelined_len = extra;
+                    break;
+                }
+            },
+            constants.tls_record_alert => {
+                if (body_len > 256) return error.ConnectionReset;
+                _ = try readExact(stream, body_buf[0..body_len]);
+                return error.ConnectionReset;
+            },
+            else => return error.ConnectionReset,
+        }
     }
+
+    return out;
 }
 ```
 
-</details>
+Then in `handleConnectionInner()`:
 
----
+```zig
+// after first byte arrives
+setRecvTimeout(fd, handshake_timeout_sec);
 
-### 4) Count pipelined bytes as C2S for diagnostics
-Right now the signature `c2s=0 s2c≈154` is misleading because pre-relay pipelined bytes are invisible.
+// ... ClientHello read/validate ...
 
-Change:
+try writeAll(client_stream, server_hello);
+
+const initial = try readInitialClientHandshake(client_stream);
+
+log.info("[{d}] ({s}) Initial MTProto handshake assembled from {d} AppData record(s), pipelined={d}B", .{
+    conn_id, peer_str, initial.app_records_used, initial.pipelined_len,
+});
+
+const handshake: *const [constants.handshake_len]u8 = &initial.wire_handshake;
+```
+
+And later:
 
 ```zig
 var initial_c2s_bytes: u64 = 0;
 
-if (payload_len > constants.handshake_len) {
-    const pipelined = payload_buf[constants.handshake_len..payload_len];
-    log.info("[{d}] ({s}) Pipelined {d}B after handshake", .{
-        conn_id, peer_str, pipelined.len,
-    });
-
+if (initial.pipelined_len > 0) {
+    const pipelined = initial.pipelined_buf[0..initial.pipelined_len];
     client_decryptor.apply(pipelined);
     tg_encryptor.apply(pipelined);
     try writeAll(dc_stream, pipelined);
-
     initial_c2s_bytes = pipelined.len;
-} else {
-    log.info("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
 }
-
-try relayBidirectional(
-    client_stream,
-    dc_stream,
-    &client_decryptor,
-    &client_encryptor,
-    &tg_encryptor,
-    &tg_decryptor,
-    initial_c2s_bytes,
-    conn_id,
-);
 ```
 
-That will stop you from chasing fake `c2s=0` failures that were actually `pipelined>0`.
+</details>
 
 ---
 
-## Why this likely helps the iPhone issue too
+## Why I think this is higher-value than more crypto digging
 
-I’m not fully certain this is the whole iPhone fix, but these are the right first changes because they directly affect the pattern you’re seeing:
+Because the current evidence says:
 
-- **partial ServerHello/DC nonce writes** can create intermittent failures;
-- **premature `POLLHUP` handling** can truncate the exact first short S2C reply;
-- **misleading `c2s=0` metrics** can hide that the client already sent the first request in the handshake record.
+- **Mac MB-scale success** means your crypto is not broadly wrong.
+- **iPhone “Connected”** means the FakeTLS auth path is not broadly wrong.
+- That leaves **timing / fragmentation / connection pooling behavior** as the main delta.
 
-Also, some of the “Mac failures” may be **speculative/raced connections**, not real protocol failures. Telegram clients do open loser connections and reset them.
+And the code currently has a clear iOS-hostile assumption in exactly that area.
 
 ---
 
-## If CPU is still high after removing packet logs
+## What I would *not* spend more time on first
 
-Do this on the VPS before changing more protocol logic:
+I would deprioritize:
+- `buildServerHello()` again,
+- HMAC scope again,
+- timestamp XOR again,
+- DC CTR math again.
 
-```bash
-pid=$(pidof mtproto-proxy)
-ps -L -o pid,tid,pcpu,stat,wchan:32,comm -p "$pid" | sort -k3 -nr | head -30
+Those were good fixes, but they are no longer the most likely problem.
+
+---
+
+## Secondary suspect: S2C shaping
+
+If the handshake-lifecycle patch above does **not** fix iPhone, then my next move would be:
+
+### Freeze S2C TLS records at a small fixed size
+Temporarily make:
+
+```zig
+const DynamicRecordSizer = struct {
+    fn init() DynamicRecordSizer {
+        return .{
+            .current_size = 1369,
+            .records_sent = 0,
+            .bytes_sent = 0,
+        };
+    }
+
+    fn nextRecordSize(self: *DynamicRecordSizer) usize {
+        _ = self;
+        return 1369; // fixed for compatibility test
+    }
+
+    fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
+        _ = self;
+        _ = payload_len;
+    }
+};
 ```
 
-Then attach to one hot thread:
+If iPhone suddenly starts syncing, then the remaining issue is your fake-TLS S2C recordization, not the MTProto crypto.
 
-```bash
-strace -ttT -fp <TID> -e poll,read,write,recvfrom,sendto,fcntl
+---
+
+## Tertiary suspect: your non-FAST_MODE S2C path
+
+I agree that non-FAST_MODE is theoretically valid.
+
+But pragmatically, if iPhone still fails after fixing handshake timing/fragmentation, then the fastest route to a production fix is:
+
+### Add canonical `FAST_MODE` as a toggle
+Because that gives you:
+- parity with the canonical Python proxy’s default behavior,
+- less S2C machinery,
+- less chance of a subtle S2C keystream mismatch.
+
+So I would treat FAST_MODE as the **best A/B test** after the handshake patch, not as the first fix.
+
+---
+
+## Very useful low-overhead instrumentation
+
+Do **not** add hot-path hex dumps again.
+
+Instead add only these:
+
+### Handshake-stage logs
+These are cheap and very informative:
+- short read while reading ClientHello body,
+- short read while waiting for post-ServerHello TLS record,
+- number of AppData records needed to assemble the initial $64$ bytes,
+- pipelined bytes size.
+
+If iPhone often needs `2+` AppData records and Mac uses `1`, you found it.
+
+---
+
+### TLS Alert body logging
+Right now `relayClientToDc()` treats TLS Alert as just reset.
+
+Instead log the body once:
+
+```zig
+if (record_type == constants.tls_record_alert) {
+    const alert_len = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+    var alert_buf: [256]u8 = undefined;
+
+    if (alert_len <= alert_buf.len and
+        try readExact(client, alert_buf[0..alert_len]) == alert_len and
+        alert_len >= 2)
+    {
+        log.info("[{d}] C2S TLS Alert level={d} desc={d}", .{
+            conn_id, alert_buf[0], alert_buf[1],
+        });
+    }
+
+    return error.ConnectionReset;
+}
 ```
 
-What to look for:
+### Why this matters
+If iPhone starts sending TLS alerts right after first S2C:
+- the client is actively rejecting your fake-TLS stream,
+- which points to S2C recordization or S2C crypto.
 
-- Repeating `poll(...) = 1` + `read(...) = -1 EAGAIN`
-  - real poll/read spin
-- Repeating `write(...) = -1 EAGAIN` + `poll(...POLLOUT...) = 1`
-  - write-side spin
-- No syscalls but high CPU
-  - formatter/logging or pure userspace loop
-
-If available, also:
-
-```bash
-perf top -H -p "$pid"
-```
-
-If top frames are in `std.fmt` / logging paths, that confirms the tracer is the CPU hog.
+If there are **no** alerts and instead you see handshake-stage short reads:
+- it’s timing/fragmentation/pooling.
 
 ---
 
-## One more pragmatic step: test a debug-safe Linux build once
-For one controlled iPhone test, I would deploy:
+## One more important interpretation
 
-```bash
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux
-```
+Some failed Mac connections are probably **normal loser/speculative connections**.
 
-Just once, with packet logging **off**.
+Telegram clients race and abandon sockets. So:
+- don’t chase every `polls=2 c2s=0 s2c≈154` on Mac,
+- chase the fact that **Mac has at least one connection that goes MB-scale, while iPhone never does**.
 
-Why:
-- if you have UB from a stack issue / formatting edge / accidental overwrite, `ReleaseSafe` is much more likely to surface it;
-- your current combination of `ReleaseFast` + multi-thread + hot logging is the worst possible debug environment.
-
-If you want to be extra conservative for that test, temporarily bump thread stack to `256 * 1024`.
+That means the remaining bug is likely affecting a connection style that Desktop can recover from but iOS cannot.
 
 ---
 
-## If iPhone still fails after the relay fixes
+## My recommended order
 
-Then my next protocol A/B would be:
+1. **Move the handshake timeout later**  
+   Don’t use the $10$s timeout until the full $64$-byte MTProto handshake has been assembled.
 
-### Implement canonical **FAST_MODE** as a toggle
-Reason:
-- your current failures are S2C-centric;
-- canonical Python defaults to FAST_MODE;
-- FAST_MODE removes one whole S2C decrypt/re-encrypt chain;
-- it also reduces CPU.
+2. **Support fragmented initial MTProto handshake across multiple TLS AppData records**  
+   This is the most concrete code bug still present.
 
-I would not rip out your current full re-encrypt path; I would add:
+3. **Disable DRS ramp**  
+   Fixed small S2C records for compatibility testing.
 
-- `fast_mode = true` default
-- keep current path as fallback
+4. **Add handshake-stage short-read logging + TLS alert logging**
 
-That gives you the fastest answer to: “is the remaining iPhone failure specifically in my S2C full re-encrypt path?”
+5. **If iPhone still fails: add FAST_MODE toggle**  
+   That becomes the fastest route to production parity.
 
 ---
 
-## My recommended deployment order
+## My confidence
 
-1. **Remove packet hex dumps** from hot relay path.
-2. **Fix `writeAll` usage** for `server_hello` and DC nonce.
-3. **Replace relay loop** with the progress-aware version above.
-4. **Count pipelined bytes** in C2S totals.
-5. Deploy.
-6. Re-test:
-   - Mac from `81.17.27.66`
-   - iPhone from `109.252.90.134`
-   - VPN `103.242.74.56`
-7. Only if iPhone still fails, add **FAST_MODE toggle**.
+- **High confidence** that the current post-ServerHello state machine is still too Desktop-specific.
+- **Medium-high confidence** that fixing handshake timing + fragmented initial AppData handling will improve iPhone materially.
+- **Medium confidence** that if anything remains after that, it will be S2C shaping or the non-FAST_MODE path.
 
----
-
-If you want, I can turn this into a **single ready-to-paste patch for `src/proxy/proxy.zig`** with minimal diff formatting.
+If you want, I can turn this into a **single ready-to-paste patch for `src/proxy/proxy.zig`** with:
+- fragmented initial-handshake assembly,
+- later timeout arming,
+- fixed-size S2C TLS records,
+- and TLS alert logging.

@@ -1,63 +1,35 @@
-Goal
-Build a production MTProto proxy in Zig (Telegram proxy) that works with all clients including iPhone/iOS Telegram. The proxy implements FakeTLS + MTProto Obfuscated2 protocol to relay traffic between Telegram clients and Telegram datacenters.
+# Goal
+Fix iPhone (iOS) Telegram connectivity. The proxy works perfectly on Mac Telegram Desktop, but iPhone stays stuck on "Updating..." even though it shows "Connected" in the proxy settings.
 
-Instructions
-- The server runs as a systemd service on a Linux VPS at 45.77.223.232, deployed via make deploy which cross-compiles from Mac and SCPs the binary
-- Cross-compilation: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
-- Zig version: 0.15
-- User IPs: 81.17.27.66 = Mac, 109.252.90.134 = iPhone (also tried VPN IP 103.242.74.56)
-- Deploy requires stopping service first due to ReadOnlyPaths=/opt/mtproto-proxy in systemd unit — Makefile handles this (stop → scp → start)
+# Instructions for the Model
+Analyze the provided codebase and the specific behavioral differences between Mac and iPhone. Identify why the iPhone might be rejecting the relayed data or why the MTProto session isn't fully establishing despite successful TLS handshakes and initial data exchange.
 
-Discoveries
-Architecture & Prior Fixes
-1. iOS TCP Connection Pooling: iOS Telegram pre-opens 2-5 idle TCP connections (pool warming). Short timeouts kill these, causing iOS to mark proxy as unstable. Solution: two-stage timeout with poll() (5-min idle) then SO_RCVTIMEO (10s active).
-2. GPA Mutex Deadlock: GeneralPurposeAllocator has an internal mutex causing deadlocks under heavy thread contention. Fixed by switching to std.heap.page_allocator.
-3. Three critical bugs in buildServerHello were fixed based on canonical Telegram client source (ConnectionSocket.cpp):
-   - Bug 1 - HMAC Scope: The HMAC must cover the entire response (ServerHello + CCS + fake AppData records), not just the ServerHello record.
-   - Bug 2 - Timestamp XOR was incorrectly ADDED: Server response HMAC has NO timestamp XOR (timestamp XOR is client-side only).
-   - Bug 3 - Fake AppData record is REQUIRED: Client expects three records: ServerHello \x16\x03\x03, CCS \x14\x03\x03\x00\x01\x01, Fake AppData \x17\x03\x03.
-Canonical Python mtprotoproxy Analysis (THIS SESSION)
-4. FAST_MODE in canonical Python proxy: The canonical Python proxy (alexbers/mtprotoproxy) has FAST_MODE=True by default. In FAST_MODE:
-   - Client's enc_key+enc_iv (already SHA256-hashed key + raw IV) is embedded reversed into the DC nonce at rnd[8..56)
-   - DC decryptor and client encryptor are replaced with no-ops for S2C direction
-   - S2C data passes through without decrypt/re-encrypt (DC encrypts with same keystream client expects)
-   - C2S direction always does full decrypt+re-encrypt regardless of FAST_MODE
-5. Our Zig proxy uses non-FAST_MODE behavior — full decrypt/re-encrypt in both directions with independent DC keys. This is correct and should work. Exhaustive comparison confirmed:
-   - Counter states match canonical: client_decryptor=4, client_encryptor=0, tg_encryptor=4, tg_decryptor=0
-   - Key derivation matches exactly: decrypt_key = SHA256(dec_prekey || secret), encrypt_key = SHA256(reversed_prekey || secret)
-   - DC nonce construction matches: raw keys (no SHA256), encrypt full nonce but only replace bytes from proto_tag_pos onward
-   - Direction semantics in relay match: S2C = tg_decryptor → client_encryptor → TLS wrap; C2S = TLS unwrap → client_decryptor → tg_encryptor
-Current Critical Bug (THIS SESSION)
-6. CPU busy-loop / spin bug: After adding diagnostic hex-dump logging to relayDcToClient and relayClientToDc, the deployed proxy enters a 95-100% CPU busy-loop with many threads (48-280) that never produce log output. Connections are accepted (threads spawned) but relay diagnostics never appear. The process becomes unresponsive to logging.
-   Root cause NOT YET identified but likely suspects:
-   - The diagnostic logging itself may be triggering the issue (format string with hex slice {x:0>2} on a slice could have issues in ReleaseFast)
-   - Possible interaction between non-blocking sockets and the diagnostic code paths
-   - The busy-loop existed BEFORE this session's changes too (280 threads accumulated in previous deployment before restart) — the diagnostics just made it more visible
-   Evidence: Before restart, the old binary had accumulated 280 threads doing nothing (all idle pool connections from iPhone). After restart with new binary, Mac connected successfully (TLS OK, MTProto OK, 304B pipelined data), entered relay, but then NO further log output appeared while CPU hit 95.7% with 48 threads.
+# Current Status & Observations
+- **Mac Telegram**: Works flawlessly. Stable connections, MBs of data exchanged.
+- **iPhone (iOS) Telegram**: 
+    - Shows "Connected" in settings.
+    - Status stays at "Updating...".
+    - Logs show many "idle pooled" connections (warmed by iOS but never used).
+    - Some connections *do* exchange data (e.g., 20KB C2S, 50KB S2C) and survive for minutes, but no messages load.
+    - Some connections fail with `ConnectionReset` immediately after pipelined data.
+    - Massive disparity in S2C data volume: Mac gets MBs, iPhone maxes out at ~50KB.
 
-Accomplished
-Completed:
-- ✅ Two-stage timeout (idle poll() 5min → active SO_RCVTIMEO 10s)
-- ✅ Thread stack size reduced to 128KB
-- ✅ Replaced GPA with std.heap.page_allocator
-- ✅ Max concurrent connection limit (atomic counter, cap 8192)
-- ✅ TasksMax=65535 in systemd service file
-- ✅ Peer IP in all log messages via formatAddress() helper
-- ✅ Diagnostic byte counters and direction-specific error logging in relay
-- ✅ Fixed buildServerHello (HMAC over full response, no timestamp XOR, fake AppData re-added)
-- ✅ Mac Telegram Desktop works — stable connections, functional proxy
-- ✅ Full comparison of crypto chain against canonical Python mtprotoproxy — all correct
-- ✅ Added diagnostic hex-dump logging to relayDcToClient (first S2C pre/post crypto), pipelined data info, TLS Alert detection, conn_id passed to relay functions
-In Progress / Broken:
-- ⏳ CPU busy-loop bug: Latest deployed binary with diagnostics causes 95%+ CPU. Need to investigate and fix. The busy-loop may be in the relay poll() loop — if dc.read() returns WouldBlock repeatedly without the poll() catching it, or if there's a condition where poll() reports ready but no data is available, causing an infinite loop.
-- ⏳ iPhone still broken: iPhone connections (both direct 109.252.90.134 and VPN 103.242.74.56) fail with c2s=0 s2c=~100-200 ConnectionReset — iPhone never sends relay data
-- ⏳ Mac connections also partially fail: Some Mac connections show same pattern (polls=2 c2s=0 s2c=~154 ConnectionReset) — only some Mac connections survive and work
-Next Steps:
-1. Fix the CPU busy-loop — most likely in relayBidirectional poll loop. Check if relayClientToDc or relayDcToClient can silently return (not error) when the connection is actually dead, causing poll() to spin. The WouldBlock handling return if (err == error.WouldBlock) {} else err returns void (success) which makes the outer loop continue to poll() — this is by design but could spin if the socket is in a broken state that always reports ready.
-2. Once busy-loop is fixed, the hex-dump diagnostics should reveal why S2C data causes iPhone (and some Mac connections) to RST.
-3. Investigate the polls=2 c2s=0 s2c=~100-200 pattern — this happens on BOTH Mac and iPhone. Some connections die immediately after first S2C relay. Could be auth key negotiation responses that the client rejects.
+# Latest Fixes Implemented
+- **Relay Loop Robustness**: Introduced `RelayProgress` enum to track if data was actually forwarded, partially read, or skipped.
+- **Spin Detection**: Added logic to detect no-progress poll loops (32 iterations without progress) to prevent CPU busy-loops.
+- **Pipelined Data**: Fixed `c2s_bytes` accounting to include pipelined data sent before the main relay loop.
+- **Drain-First Logic**: Updated `relayBidirectional` to prioritize draining readable data (POLLIN) even if POLLHUP is present, ensuring trailing bytes aren't lost.
+- **Write Reliability**: Switched to a robust `writeAll` helper across all critical paths.
 
-Codebase
+# Discoveries & Analysis
+1. **iOS TCP Connection Pooling**: iOS opens 2-5 idle sockets. We handle this with a two-stage timeout (5min idle poll -> 10s active timeout).
+2. **Three critical bugs in buildServerHello were fixed**:
+   - HMAC now covers full response (ServerHello + CCS + Fake AppData).
+   - No timestamp XOR in server response HMAC.
+   - Fake AppData record (\x17\x03\x03) appended.
+3. **Crypto Matching**: Crypto chain (keys, IVs, direction semantics) verified against canonical Python `mtprotoproxy`. We use independent DC keys (non-FAST_MODE), which is correct.
+
+# Codebase
 
 --- src/main.zig ---
 ```zig
@@ -1794,7 +1766,7 @@ fn handleConnectionInner(
     );
     defer state.allocator.free(server_hello);
 
-    _ = try client_stream.write(server_hello);
+    try writeAll(client_stream, server_hello);
 
     // Read 64-byte MTProto handshake (wrapped in TLS Application Data)
     // The client may send a Change Cipher Spec (CCS) record first — skip it.
@@ -1901,7 +1873,7 @@ fn handleConnectionInner(
     @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
     @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
 
-    _ = try dc_stream.write(&nonce_to_send);
+    try writeAll(dc_stream, &nonce_to_send);
     // tg_encryptor counter is now at position 4 (past 64 bytes), correct for subsequent data
 
     var tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
@@ -1937,6 +1909,8 @@ fn handleConnectionInner(
     // Fix #3: Handle pipelined data — Telegram clients send their first RPC request
     // immediately after the 64-byte handshake in the same TLS record. If we don't
     // forward these bytes, the client's first message is silently lost.
+    var initial_c2s_bytes: u64 = 0;
+
     if (payload_len > constants.handshake_len) {
         const pipelined = payload_buf[constants.handshake_len..payload_len];
         log.info("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
@@ -1944,6 +1918,7 @@ fn handleConnectionInner(
         client_decryptor.apply(pipelined);
         tg_encryptor.apply(pipelined);
         try writeAll(dc_stream, pipelined);
+        initial_c2s_bytes = pipelined.len;
     } else {
         log.info("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
     }
@@ -1955,11 +1930,23 @@ fn handleConnectionInner(
         &client_encryptor,
         &tg_encryptor,
         &tg_decryptor,
+        initial_c2s_bytes,
         conn_id,
     ) catch |err| {
         log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
     };
 }
+
+/// Relay progress tracking: distinguishes between no data available,
+/// partial TLS record assembly, and fully forwarded payloads.
+const RelayProgress = enum {
+    /// No data was read (WouldBlock on first read)
+    none,
+    /// Some bytes were consumed but a full record hasn't been forwarded yet
+    partial,
+    /// At least one complete record was forwarded
+    forwarded,
+};
 
 /// Bidirectional relay between client (TLS + AES-CTR) and Telegram DC (AES-CTR).
 ///
@@ -1973,6 +1960,7 @@ fn relayBidirectional(
     client_encryptor: *crypto.AesCtr,
     tg_encryptor: *crypto.AesCtr,
     tg_decryptor: *crypto.AesCtr,
+    initial_c2s_bytes: u64,
     conn_id: u64,
 ) !void {
     var fds = [2]posix.pollfd{
@@ -1994,36 +1982,31 @@ fn relayBidirectional(
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
 
     // Byte counters for diagnostics
-    var c2s_bytes: u64 = 0;
+    var c2s_bytes: u64 = initial_c2s_bytes;
     var s2c_bytes: u64 = 0;
     var poll_iterations: u64 = 0;
-    var no_progress_count: u32 = 0;
+    var no_progress_polls: u32 = 0;
 
     while (true) {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+
         const ready = try posix.poll(&fds, relay_timeout_ms);
         if (ready == 0) {
             log.debug("[{d}] Relay: idle timeout (no data for 5 min), c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
+
         poll_iterations += 1;
+        var progressed = false;
 
-        // Check for errors/hangup/invalid FD
-        const err_mask = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
-        if (fds[0].revents & err_mask != 0) {
-            log.debug("[{d}] Relay: client side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[0].revents, poll_iterations, c2s_bytes, s2c_bytes });
-            return error.ConnectionReset;
-        }
-        if (fds[1].revents & err_mask != 0) {
-            log.debug("[{d}] Relay: DC side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[1].revents, poll_iterations, c2s_bytes, s2c_bytes });
-            return error.ConnectionReset;
-        }
+        const client_revents = fds[0].revents;
+        const dc_revents = fds[1].revents;
 
-        // Track progress to detect spin loops
-        const bytes_before = c2s_bytes + s2c_bytes;
-
-        // Client → DC (C2S): read TLS records, unwrap, decrypt, re-encrypt, forward
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            relayClientToDc(
+        // IMPORTANT: drain readable data first. POLLIN|POLLHUP is common on Linux
+        // when the peer has sent final bytes and then closed.
+        if ((client_revents & posix.POLL.IN) != 0) {
+            const step = relayClientToDc(
                 client,
                 dc,
                 client_decryptor,
@@ -2039,11 +2022,11 @@ fn relayBidirectional(
                 log.debug("[{d}] Relay: C2S error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
                 return err;
             };
+            if (step != .none) progressed = true;
         }
 
-        // DC → Client (S2C): read raw, decrypt DC, encrypt client, wrap in TLS
-        if (fds[1].revents & posix.POLL.IN != 0) {
-            relayDcToClient(
+        if ((dc_revents & posix.POLL.IN) != 0) {
+            const step = relayDcToClient(
                 dc,
                 client,
                 tg_decryptor,
@@ -2055,18 +2038,58 @@ fn relayBidirectional(
                 log.debug("[{d}] Relay: S2C error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
                 return err;
             };
+            if (step != .none) progressed = true;
         }
 
-        // Spin detection: if poll() returned ready but no bytes transferred,
-        // increment counter. Terminate if stuck in a tight loop.
-        if (c2s_bytes + s2c_bytes == bytes_before) {
-            no_progress_count += 1;
-            if (no_progress_count >= 100) {
-                log.warn("[{d}] Relay: spin detected ({d} no-progress polls), terminating. c2s={d} s2c={d}", .{ conn_id, no_progress_count, c2s_bytes, s2c_bytes });
+        // Hard errors after draining readable data
+        if ((client_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+            log.debug("[{d}] Relay: client ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
+                conn_id, client_revents, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+        if ((dc_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+            log.debug("[{d}] Relay: DC ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
+                conn_id, dc_revents, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+
+        // If HUP arrived without readable data, close immediately.
+        // If it arrived with POLLIN, we already drained what we could above.
+        if (((client_revents & posix.POLL.HUP) != 0) and ((client_revents & posix.POLL.IN) == 0)) {
+            log.debug("[{d}] Relay: client HUP, polls={d} c2s={d} s2c={d}", .{
+                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+        if (((dc_revents & posix.POLL.HUP) != 0) and ((dc_revents & posix.POLL.IN) == 0)) {
+            log.debug("[{d}] Relay: DC HUP, polls={d} c2s={d} s2c={d}", .{
+                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+
+        // Spin detection: track progress including partial TLS record assembly.
+        // Old approach only checked byte counters, missing partial reads that
+        // represent real forward progress.
+        if (!progressed) {
+            no_progress_polls += 1;
+            if (no_progress_polls >= 32) {
+                log.warn("[{d}] Relay: no-progress poll loop, client_revents=0x{x} dc_revents=0x{x} hdr={d} body_pos={d} body_len={d} c2s={d} s2c={d}", .{
+                    conn_id,
+                    client_revents,
+                    dc_revents,
+                    tls_hdr_pos,
+                    tls_body_pos,
+                    tls_body_len,
+                    c2s_bytes,
+                    s2c_bytes,
+                });
                 return error.ConnectionReset;
             }
         } else {
-            no_progress_count = 0;
+            no_progress_polls = 0;
         }
     }
 }
@@ -2075,6 +2098,7 @@ fn relayBidirectional(
 ///
 /// Uses incremental state so partial reads across poll iterations are handled correctly.
 /// Both CCS and Application Data records share the same body buffer to survive WouldBlock.
+/// Returns progress indicator for spin detection in the relay loop.
 fn relayClientToDc(
     client: net.Stream,
     dc: net.Stream,
@@ -2087,39 +2111,45 @@ fn relayClientToDc(
     tls_body_len: *usize,
     bytes_counter: *u64,
     conn_id: u64,
-) !void {
+) !RelayProgress {
+    _ = conn_id;
+
+    var consumed_any = false;
+
     // Read as much as possible in this call
     while (true) {
         if (tls_hdr_pos.* < tls_header_len) {
             // Still reading TLS header
             const nr = client.read(tls_hdr_buf[tls_hdr_pos.*..]) catch |err| {
-                return if (err == error.WouldBlock) {} else err;
+                if (err == error.WouldBlock) {
+                    return if (consumed_any) .partial else .none;
+                }
+                return err;
             };
             if (nr == 0) return error.ConnectionReset;
+
+            consumed_any = true;
             tls_hdr_pos.* += nr;
 
-            if (tls_hdr_pos.* < tls_header_len) return; // need more header bytes
+            if (tls_hdr_pos.* < tls_header_len) return .partial; // need more header bytes
 
             // Parse TLS record header
             const record_type = tls_hdr_buf[0];
 
             if (record_type == constants.tls_record_alert) {
                 // Alert = peer closing
-                log.info("[{d}] C2S: received TLS Alert, c2s={d}", .{ conn_id, bytes_counter.* });
                 return error.ConnectionReset;
             }
 
-            if (record_type == constants.tls_record_change_cipher or
-                record_type == constants.tls_record_application)
-            {
-                tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-                if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
-                    return error.ConnectionReset;
-                }
-                tls_body_pos.* = 0;
-            } else {
-                // Unexpected record type
-                return error.ConnectionReset;
+            switch (record_type) {
+                constants.tls_record_change_cipher, constants.tls_record_application => {
+                    tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+                    if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
+                        return error.ConnectionReset;
+                    }
+                    tls_body_pos.* = 0;
+                },
+                else => return error.ConnectionReset,
             }
         }
 
@@ -2130,16 +2160,22 @@ fn relayClientToDc(
             tls_hdr_pos.* = 0;
             tls_body_pos.* = 0;
             tls_body_len.* = 0;
+            if (consumed_any) return .partial;
             continue;
         }
 
         const nr = client.read(tls_body_buf[tls_body_pos.*..][0..remaining]) catch |err| {
-            return if (err == error.WouldBlock) {} else err;
+            if (err == error.WouldBlock) {
+                return if (consumed_any) .partial else .none;
+            }
+            return err;
         };
         if (nr == 0) return error.ConnectionReset;
+
+        consumed_any = true;
         tls_body_pos.* += nr;
 
-        if (tls_body_pos.* < tls_body_len.*) return; // need more body bytes
+        if (tls_body_pos.* < tls_body_len.*) return .partial; // need more body bytes
 
         // Full record body received — check record type
         if (tls_hdr_buf[0] == constants.tls_record_change_cipher) {
@@ -2167,12 +2203,13 @@ fn relayClientToDc(
         tls_hdr_pos.* = 0;
         tls_body_pos.* = 0;
         tls_body_len.* = 0;
-        return; // processed one record, return to poll
+        return .forwarded; // processed one record, return to poll
     }
 }
 
 /// S2C direction: Read from DC, AES-CTR decrypt DC, AES-CTR encrypt for client, wrap in TLS, send.
 /// Uses DRS (Dynamic Record Sizing) to mimic real browser TLS behavior.
+/// Returns progress indicator for spin detection in the relay loop.
 fn relayDcToClient(
     dc: net.Stream,
     client: net.Stream,
@@ -2181,15 +2218,14 @@ fn relayDcToClient(
     dc_read_buf: *[constants.default_buffer_size]u8,
     drs: *DynamicRecordSizer,
     bytes_counter: *u64,
-) !void {
+) !RelayProgress {
     const nr = dc.read(dc_read_buf) catch |err| {
-        return if (err == error.WouldBlock) {} else err;
+        if (err == error.WouldBlock) return .none;
+        return err;
     };
     if (nr == 0) return error.ConnectionReset;
 
     const data = dc_read_buf[0..nr];
-
-    bytes_counter.* += nr;
 
     // AES-CTR decrypt DC obfuscation
     tg_decryptor.apply(data);
@@ -2216,28 +2252,39 @@ fn relayDcToClient(
         drs.recordSent(chunk_len);
         offset += chunk_len;
     }
+
+    bytes_counter.* += nr;
+    return .forwarded;
 }
 
 /// Write all bytes to a stream, handling partial writes and backpressure.
 /// On non-blocking sockets, waits for POLLOUT when the send buffer is full.
+/// Includes a spin counter to prevent infinite WouldBlock loops on broken sockets.
 fn writeAll(stream: net.Stream, data: []const u8) !void {
     var written: usize = 0;
+    var wouldblock_spins: u8 = 0;
+
     while (written < data.len) {
         const nw = stream.write(data[written..]) catch |err| {
             if (err == error.WouldBlock) {
+                wouldblock_spins += 1;
+                if (wouldblock_spins >= 32) return error.ConnectionReset;
+
                 // Wait for the socket to become writable
                 var fds = [1]posix.pollfd{
                     .{ .fd = stream.handle, .events = posix.POLL.OUT, .revents = 0 },
                 };
                 const ready = try posix.poll(&fds, relay_timeout_ms);
                 if (ready == 0) return error.ConnectionReset; // write timeout
-                if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0)
+                if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0)
                     return error.ConnectionReset;
+                if ((fds[0].revents & posix.POLL.OUT) == 0) continue;
                 continue;
             }
             return err;
         };
         if (nw == 0) return error.ConnectionReset;
+        wouldblock_spins = 0;
         written += nw;
     }
 }

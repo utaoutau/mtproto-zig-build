@@ -11,10 +11,31 @@ const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
 
-// Override default log level so info/debug messages are visible in release builds.
+// Custom lock-free log function: formats into a stack buffer and writes
+// to stderr in a single write() syscall. On Linux, write() is atomic for
+// sizes <= PIPE_BUF (4096 bytes), so messages from different threads
+// don't interleave. This avoids the global stderr_mutex that Zig's
+// default logger uses, which causes catastrophic contention under
+// hundreds of concurrent threads.
 pub const std_options = std.Options{
-    .log_level = .debug,
+    // ReleaseFast default (.info) compiles out all log.debug calls entirely.
+    // DO NOT override to .debug in production — it causes 99% CPU from
+    // stderr mutex contention with hundreds of threads.
+    .logFn = lockFreeLog,
 };
+
+fn lockFreeLog(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const level_txt = comptime message_level.asText();
+    const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch return;
+    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch return;
+}
 
 const log = std.log.scoped(.mtproto);
 
