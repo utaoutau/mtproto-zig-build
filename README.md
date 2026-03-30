@@ -373,7 +373,16 @@ apt-get install -y iptables-persistent
 netfilter-persistent save
 ```
 
-> **Note** &nbsp; Replace `172.29.172.0/24` with your actual AmneziaVPN Docker subnet. Check it with `ip addr show | grep amn`.
+> **Note** &nbsp; Replace `172.29.172.0/24` with your AmneziaVPN Docker subnet. For standard WireGuard without Docker, you might need to allow traffic from `10.8.1.0/24` (or whatever your `AllowedIPs` subnet is).
+
+### Commercial / Premium VPNs Block MTProto
+
+If your iPhone is connected to a **commercial/premium VPN** (even if using the Amnezia client or WireGuard protocol) and your MTProto proxy is stuck on "Updating...", the VPN provider is likely blocking the traffic.
+
+- **DPI & TLS Inspection**: Commercial VPNs often use DPI to inspect TLS traffic. FakeTLS mimics a normal HTTPS handshake, but if the VPN actively probes the connection or analyzes the payload structure, they may detect MTProto traffic and drop it.
+- **IP Blocking**: The VPN may outright block connections to Telegram datacenter IP ranges.
+
+**Solution**: Use a self-hosted VPN (like AmneziaWG) on your own server. Your own server won't restrict outbound MTProto traffic.
 
 ## &nbsp; License
 

@@ -267,8 +267,21 @@ When the proxy and AmneziaVPN run on the same server, iOS VPN clients cannot rea
 
 **Fix**:
 ```bash
+# Allow WireGuard client IPs (default AmneziaWG is 10.8.1.x)
+iptables -I DOCKER-USER -s 10.8.1.0/24 -p tcp --dport 443 -j ACCEPT
+
+# Allow Docker network IPs (if proxy runs from another container)
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
+
 netfilter-persistent save
+```
+
+### Commercial / Premium VPNs Filtering
+If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN provider's firewall often drops MTProto traffic by design:
+- **DPI**: They perform Deep Packet Inspection and drop FakeTLS connections that do not act identically to standard browsers.
+- **IP Blocking**: They silently block TCP routing to Telegram Datacenter IPs.
+- **Symptoms**: Proxy sits in "Updating..." state indefinitely. The proxy instance receives 0 packets from the VPN exit node.
+- **Solution**: Use self-hosted VPNs (like the co-located AmneziaWG above) which do not perform traffic filtering or DPI on outbound connections.
 
 ---
 
