@@ -203,8 +203,9 @@ sudo tee /opt/mtproto-proxy/config.toml <<EOF
 port = 443
 
 [censorship]
-tls_domain = "google.com"
+tls_domain = "wb.ru"
 mask = true
+fast_mode = true
 
 [access.users]
 user = "$SECRET"
@@ -246,7 +247,7 @@ tg://proxy?server=<SERVER_IP>&port=443&secret=ee<SECRET><HEX_DOMAIN>
 Where `<HEX_DOMAIN>` is your `tls_domain` encoded as hex:
 
 ```bash
-echo -n "google.com" | xxd -p     # → 676f6f676c652e636f6d
+echo -n "wb.ru" | xxd -p     # → 77622e7275
 ```
 
 </details>
@@ -276,8 +277,9 @@ Create a `config.toml` in the project root:
 port = 443
 
 [censorship]
-tls_domain = "google.com"
+tls_domain = "wb.ru"
 mask = true
+fast_mode = true
 
 [access.users]
 alice = "00112233445566778899aabbccddeeff"
@@ -290,7 +292,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `[server]` | `port` | `443` | TCP port to listen on |
-| `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
+| `[censorship]` | `tls_domain` | `"wb.ru"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
