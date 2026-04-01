@@ -85,6 +85,41 @@ const DynamicRecordSizer = struct {
     }
 };
 
+/// Anti-Replay Cache — defends against ТСПУ "Revisor" active probing.
+///
+/// The Revisor scanner captures a real client's TLS ClientHello and replays it
+/// byte-for-byte to our server. Because the HMAC uses the user secret + timestamp
+/// (valid within ±2 min), a replayed digest will pass HMAC validation and expose
+/// us as a proxy server.
+///
+/// Fix: Telegram clients NEVER repeat the same 32-byte random digest. We cache
+/// all seen digests in a ring buffer. If we see the same digest twice, it's a
+/// replay attack — we forward to the real tls_domain transparently instead.
+const ReplayCache = struct {
+    mutex: std.Thread.Mutex = .{},
+    /// Ring buffer of seen TLS ClientHello digests (32 bytes each)
+    entries: [4096][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 4096,
+    /// Next write position in the ring buffer
+    idx: usize = 0,
+
+    /// Returns true if this digest was seen before (replay attack).
+    /// Adds the digest to the cache if it's new.
+    pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Scan the ring buffer for a match
+        for (&self.entries) |*cached| {
+            if (std.mem.eql(u8, cached, digest)) return true; // replay detected!
+        }
+
+        // New digest — store it
+        self.entries[self.idx] = digest.*;
+        self.idx = (self.idx + 1) % self.entries.len;
+        return false;
+    }
+};
+
 /// Shared proxy state — passed by reference, no globals.
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
@@ -99,6 +134,8 @@ pub const ProxyState = struct {
     /// Resolved once at startup to avoid per-connection DNS (getaddrinfo)
     /// which uses ~48-80KB of stack and causes SEGFAULT on 128KB threads.
     mask_addr: ?net.Address,
+    /// Anti-replay cache — detects ТСПУ Revisor active probing.
+    replay_cache: ReplayCache,
 
     /// Maximum concurrent connections before rejecting new ones.
     /// Prevents thread exhaustion under load.
@@ -137,6 +174,7 @@ pub const ProxyState = struct {
             .connection_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
+            .replay_cache = .{},
         };
     }
 
@@ -146,7 +184,15 @@ pub const ProxyState = struct {
 
     /// Start the proxy server.
     pub fn run(self: *ProxyState) !void {
-        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
+        // Bind to IPv6 wildcard [::] — on Linux with IPV6_V6ONLY=0 (default),
+        // this also accepts IPv4-mapped connections (::ffff:x.x.x.x).
+        // This enables IPv6 address hopping for DPI evasion without restart.
+        const address = net.Address.initIp6(
+            .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, // [::]
+            self.config.port,
+            0, // flowinfo
+            0, // scope_id
+        );
         var server = try address.listen(.{
             .reuse_address = true,
         });
@@ -300,12 +346,25 @@ fn handleConnectionInner(
     );
 
     if (validation == null) {
-        log.debug("[{d}] ({s}) TLS auth failed", .{ conn_id, peer_str });
+        log.debug("[{d}] ({s}) TLS auth failed — masking to {s}", .{ conn_id, peer_str, state.config.tls_domain });
         maskConnection(state, client_stream, peer_str, conn_id, client_hello, null);
         return;
     }
 
     const v = validation.?;
+
+    // Anti-Replay Check: ТСПУ "Revisor" replays a captured ClientHello byte-for-byte
+    // to confirm our server is a proxy. Legitimate Telegram clients NEVER reuse a digest.
+    // If we see the same digest twice — it's active probing. Forward to real tls_domain
+    // so the scanner sees a legitimate CDN response and whitelists our IP.
+    if (state.replay_cache.checkAndInsert(&v.digest)) {
+        log.info("[{d}] ({s}) Replay attack detected (ТСПУ Revisor) — masking to {s}", .{
+            conn_id, peer_str, state.config.tls_domain,
+        });
+        maskConnection(state, client_stream, peer_str, conn_id, client_hello, null);
+        return;
+    }
+
     log.info("[{d}] ({s}) TLS auth OK: user={s}", .{ conn_id, peer_str, v.user });
 
     // Send ServerHello response

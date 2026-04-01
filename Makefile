@@ -1,6 +1,6 @@
 .PHONY: build release run test clean fmt deploy
 
-SERVER ?= 209.131.70.125
+SERVER ?= 154.59.110.193
 CONFIG ?= config.toml
 
 build:

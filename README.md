@@ -35,10 +35,12 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **MTProto v2** | Obfuscation | AES-256-CTR encrypted tunneling (abridged, intermediate, secure) |
 | **DRS** | Dynamic Record Sizing | Mimics real browser TLS behavior (Chrome/Firefox) to resist fingerprinting |
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
-| **Anti-replay** | Timestamp Validation | Rejects replayed handshakes outside a +/- 2 min window |
+| **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
 | **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
+| **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
+| **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
@@ -155,7 +157,16 @@ This will:
 3. Generate a random 16-byte secret
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open port 443 in `ufw` (if active)
-6. Print a ready-to-use `tg://` connection link
+6. Apply **TCPMSS=88** iptables rule (passive DPI bypass)
+7. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
+8. Print a ready-to-use `tg://` connection link
+
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection):
+
+```bash
+curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | \
+  sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> bash
+```
 
 ### Manual deploy
 
@@ -314,17 +325,21 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | Constant-time comparison | HMAC validation uses constant-time byte comparison to prevent timing attacks |
 | Key wiping | All key material is zeroed from memory after use |
 | Secure randomness | Cryptographically secure RNG for all nonces and key generation |
-| Anti-replay | Embedded timestamp validation rejects handshakes outside +/- 2 min window |
+| Anti-replay (timestamp) | Embedded timestamp validation rejects handshakes outside +/- 2 min window |
+| Anti-replay (digest cache) | 4096-entry ring buffer detects ТСПУ Revisor replay probes, forwards them to real `tls_domain` |
 | Nonce validation | Rejects nonces matching HTTP, plain MTProto, or TLS patterns |
 | Dynamic Record Sizing | TLS record sizes mimic real browsers, preventing traffic fingerprinting |
 | Connection masking | Invalid clients are proxied to the real `tls_domain`, defeating DPI active probes |
+| TCPMSS clamping | MSS=88 forces ClientHello fragmentation, breaking passive DPI signature detection |
+| IPv6 address hopping | Rotates server IPv6 from /64 subnet on ban detection (TSPU can't ban /64 blocks) |
 | Systemd hardening | Runs as unprivileged user with `NoNewPrivileges`, `ProtectSystem=strict` |
 
 ## &nbsp; Project Structure
 
 ```
 ├── deploy/
-│   ├── install.sh                One-line installer for Linux
+│   ├── install.sh                One-line installer (incl. TCPMSS + IPv6 hop setup)
+│   ├── ipv6-hop.sh               IPv6 address rotation for DPI evasion
 │   └── mtproto-proxy.service     Systemd unit file
 │
 └── src/
@@ -340,7 +355,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
     │   └── obfuscation.zig       MTProto v2 obfuscation & key derivation
     │
     └── proxy/
-        └── proxy.zig             TCP listener, connection handler, relay, DRS
+        └── proxy.zig             TCP listener, connection handler, relay, DRS, ReplayCache
 ```
 
 ## &nbsp; iOS Compatibility
@@ -354,7 +369,10 @@ The proxy includes specific handling for iOS Telegram clients:
 - **Generous handshake timeout** — 60s timeout during handshake assembly (iOS may delay after ServerHello)
 - **Fixed record sizing** — TLS records are kept at MSS-sized 1369 bytes for maximum compatibility
 
-> **Important** &nbsp; Many Russian ISPs (via TSPU/DPI) block known VPS IP ranges at the network level. If the proxy appears to connect but the app stays on "Updating...", try a server in a different country/provider. The `mask = true` setting helps prevent your IP from being flagged in the first place.
+> **Important**   Russian ISPs (МГТС/Ростелеком/МегаФон) use ТСПУ DPI that detects FakeTLS signatures within ~10 minutes, then bans the VPS IP via BGP blackhole. Three countermeasures are built in:
+> - **Anti-Replay Cache** — detects "Revisor" active probes (replay attacks), forwards them to real `wb.ru`
+> - **TCPMSS=88** — forces iOS to fragment ClientHello into 6+ TCP packets, breaking DPI signature detection
+> - **IPv6 Address Hopping** — auto-rotates `/64` subnet addresses on ban detection (ТСПУ never bans /64 blocks)
 
 ## &nbsp; Running alongside AmneziaVPN / WireGuard
 

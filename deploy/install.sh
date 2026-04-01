@@ -11,7 +11,9 @@
 #   3. Generates a random user secret
 #   4. Creates a systemd service
 #   5. Opens port 443 in ufw (if active)
-#   6. Prints the ready-to-use tg:// link
+#   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
+#   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE)
+#   8. Prints the ready-to-use tg:// link
 
 set -euo pipefail
 
@@ -76,15 +78,18 @@ chmod +x "$INSTALL_DIR/mtproto-proxy"
 # ── Generate config (if not exists) ─────────────────────────
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     SECRET=$(openssl rand -hex 16)
-    TLS_DOMAIN="google.com"
+    # wb.ru is the default masking domain — must match the hex suffix in the ee-secret.
+    # ee-secret format: ee + hex(user_secret) + hex(tls_domain)
+    TLS_DOMAIN="wb.ru"
 
-    cat > "$INSTALL_DIR/config.toml" <<EOF
+    cat > "$INSTALL_DIR/config.toml" << EOF
 [server]
 port = 443
 
 [censorship]
 tls_domain = "$TLS_DOMAIN"
 mask = true
+fast_mode = true
 
 [access.users]
 user = "$SECRET"
@@ -93,7 +98,7 @@ EOF
 else
     ok "Config already exists, keeping it"
     SECRET=$(grep -oP '= "\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1 || echo "")
-    TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "google.com")
+    TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "wb.ru")
 fi
 
 # ── Create service user ─────────────────────────────────────
@@ -140,4 +145,13 @@ echo -e "  ${BOLD}Connection link:${RESET}"
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+echo ""
+echo -e "  ${BOLD}DPI Bypass active:${RESET}"
+echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
+echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
+if [[ -f /etc/cron.d/mtproto-ipv6 ]]; then
+echo -e "  ${GREEN}✓${RESET} IPv6 auto-hopping every 5 min"
+else
+echo -e "  ${DIM}○ IPv6 auto-hopping (set CF_TOKEN + CF_ZONE to enable)${RESET}"
+fi
 echo ""

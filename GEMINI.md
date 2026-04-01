@@ -8,10 +8,11 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 
 ### Current Status
 - **Mac Telegram Desktop**: Fully working, MB-scale traffic, images loading.
-- **iPhone Telegram**: Fully functional. `FAST_MODE` implemented, tested natively, and recommended by default to eliminate S2C encryption overhead.
-- **Stability**: Service previously degraded to 99% CPU within 2 days. Root cause (logging mutexes) found and fixed. Tests prove zero memory leaks.
-- **Test Coverage**: 34/34 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows. Target: weeks of stable operation.
+- **iPhone Telegram**: Fully functional via IPv6. `FAST_MODE` implemented and recommended.
+- **Stability**: Service previously degraded to 99% CPU within 2 days. Root cause (logging mutexes) found and fixed.
+- **Test Coverage**: 34/34 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows.
 - **Promotion Tag**: Supported. Sends `proxy_ans_tag` (RPC `0xaeaf0c42`) after DC handshake for sponsored channel registration.
+- **ТСПУ Evasion**: Three-layer DPI bypass implemented and active (see section below).
 
 ---
 
@@ -54,9 +55,10 @@ src/
 
 ### Threading Model
 - One thread per connection (spawned from accept loop).
-- **128KB stack per thread**: Not the default 8-16MB. This prevents OOM when handling thousands of iOS pool connections.
+- **256KB stack per thread**: Prevents OOM when handling thousands of iOS pool connections.
 - Non-blocking sockets + `poll()` in relay loop.
 - No global mutable state — `ProxyState` passed by reference.
+- Proxy binds on `[::]` (IPv6 wildcard) — automatically accepts both IPv4 and IPv6 connections.
 
 ---
 
@@ -255,6 +257,76 @@ Once iPhone connectivity is stable, test with the `DRS` ramp enabled (shifting t
 
 ---
 
+## ТСПУ / DPI Evasion (Russian ISP Blocking)
+
+### Anatomy of the Block
+Российский ТСПУ работает в **два этапа**:
+1. **Пассивный анализ**: видит FakeTLS ClientHello с SNI `wb.ru` к неизвестному VPS → SNI-IP mismatch → IP ставится в очередь на проверку.
+2. **Активные пробы («Ревизор»)**: через 5-10 минут сканер РКН подключается к серверу и:
+   - Шлёт обычный ClientHello с `SNI=wb.ru` (SNI Probe)
+   - **Replay Attack**: побитово повторяет перехваченный у клиента ClientHello. HMAC сходится → прокси отвечает ServerHello → прокси идентифицирован → бан.
+3. IP улетает в BGP-blackhole за ~20 минут. Клиенты получают 0 пакетов.
+
+### Solution 1: Anti-Replay Cache (код в `proxy.zig`)
+
+`ReplayCache` хранит 4096 последних виденных `client_digest` (32 байта каждый) в кольцевом буфере. Легитимные клиенты Telegram **никогда** не повторяют digest. При повторе — это Ревизор.
+
+```zig
+// В handleConnectionInner, после HMAC-валидации:
+if (state.replay_cache.checkAndInsert(&v.digest)) {
+    log.info("Replay attack detected (ТСПУ Revisor) — masking to {s}", ...);
+    maskConnection(state, client_stream, ...); // → реальный wb.ru:443
+    return;
+}
+```
+
+Сканер получает настоящий сертификат Wildberries и заносит IP в whitelist.
+
+### Solution 2: TCPMSS Clamping (iptables на сервере)
+
+```bash
+iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+```
+
+В SYN-ACK сервер объявляет MSS=88 байт. iOS дробит ~517-байтный ClientHello на 6 мелких TCP-пакетов. Пассивный ТСПУ не в состоянии собрать сигнатуру FakeTLS из разрозненных сегментов (reassembly engine экономит CPU на 100Gbps+ линках).
+
+Правило сохранено в `/etc/iptables/rules.v4`.
+
+### Solution 3: IPv6 Address Hopping (`deploy/ipv6-hop.sh`)
+
+AVPS получает бесплатную подсеть `/64` (18 квинтиллионов адресов). ТСПУ не банит `/64` целиком. Скрипт `ipv6-hop.sh`:
+1. Генерирует случайный IPv6 из `/64`
+2. Вешает его на интерфейс (`ip -6 addr add`)
+3. Обновляет Cloudflare AAAA-запись через API (TTL=60s)
+4. Cron-job раз в 5 минут: если `>10 Handshake timeout/мин` → автоматический hop
+
+Прокси слушает на `[::]` — ротация без рестарта. Клиент при следующем DNS lookup получает новый IPv6.
+
+```bash
+# Ручная ротация:
+/opt/mtproto-proxy/ipv6-hop.sh
+
+# Статус:
+/opt/mtproto-proxy/ipv6-hop.sh --check
+
+# Credentials (Cloudflare API):
+# CF_TOKEN и CF_ZONE хранятся в /opt/mtproto-proxy/env.sh
+```
+
+### Конфигурация для работы с ТСПУ
+```toml
+[censorship]
+tls_domain = "wb.ru"   # ВАЖНО: должен совпадать с hex-суффиксом в ee-секрете
+mask = true             # Прозрачный проброс на реальный wb.ru для неизвестных клиентов
+```
+
+### Хронология блокировок
+- **IP сжигается**: ~10 мин после первого FakeTLS соединения (пассивный детект)
+- **BGP-blackhole**: ~20 мин (0 пакетов до сервера)
+- **IPv6 не блокируется**: /64-подсети не трогают — слишком большой риск collateral damage
+
+---
+
 ## Co-located AmneziaVPN / WireGuard
 
 When the proxy and AmneziaVPN run on the same server, iOS VPN clients cannot reach `host:443` by default.
@@ -299,32 +371,50 @@ If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN pr
 ### Service & Process Monitoring
 ```bash
 # Check service status
-ssh root@209.131.70.125 'systemctl status mtproto-proxy --no-pager'
+ssh root@154.59.110.193 'systemctl status mtproto-proxy --no-pager'
 
-# Check active connections
-ssh root@209.131.70.125 'ss -tnp | grep mtproto'
+# Check active connections (IPv4 + IPv6)
+ssh root@154.59.110.193 'ss -tnp | grep mtproto'
 
 # Check process stats (CPU, threads, memory)
-ssh root@209.131.70.125 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
+ssh root@154.59.110.193 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
 ```
 
 ### Log Analysis
 ```bash
 # Check recent logs
-ssh root@209.131.70.125 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
+ssh root@154.59.110.193 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
-# Filter by IP (Mac)
-ssh root@209.131.70.125 'journalctl -u mtproto-proxy --no-pager | grep 81.17.27.66'
+# Check for Replay attacks detected (ТСПУ Revisor)
+ssh root@154.59.110.193 'journalctl -u mtproto-proxy --no-pager | grep "Replay attack"'
 
-# Filter by IP (iPhone)
-ssh root@209.131.70.125 'journalctl -u mtproto-proxy --no-pager | grep 109.252.90.134'
+# Check IPv6 hopping log
+ssh root@154.59.110.193 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
+
+# Check current active IPv6
+ssh root@154.59.110.193 'cat /tmp/mtproto-ipv6-current'
+```
+
+### IPv6 Hopping
+```bash
+# Manual hop to new IPv6 address
+ssh root@154.59.110.193 '/opt/mtproto-proxy/ipv6-hop.sh'
+
+# Check hop status
+ssh root@154.59.110.193 '/opt/mtproto-proxy/ipv6-hop.sh --check'
+
+# Check cron job
+ssh root@154.59.110.193 'cat /etc/cron.d/mtproto-ipv6'
 ```
 
 ### Low-level Debugging
 ```bash
 # Check for CLOSE-WAIT sockets
-ssh root@209.131.70.125 'ss -tnp state close-wait | grep mtproto'
+ssh root@154.59.110.193 'ss -tnp state close-wait | grep mtproto'
 
 # Check thread states in Linux /proc
-ssh root@209.131.70.125 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
+ssh root@154.59.110.193 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
+
+# Verify TCPMSS clamping rule
+ssh root@154.59.110.193 'iptables -t mangle -L OUTPUT -n -v | grep TCPMSS'
 ```
