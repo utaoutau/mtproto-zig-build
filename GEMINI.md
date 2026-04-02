@@ -56,10 +56,10 @@ deploy/
 2. Proxy validates HMAC, sends `ServerHello`.
 3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
 4. Proxy derives AES-CTR keys, connects to Telegram DC.
-5. For regular DCs, proxy sends 64-byte obfuscated nonce.
-6. For media DC203, proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
-5b. (Optional) Proxy sends promotion tag RPC (`0xaeaf0c42` + 16-byte tag) to DC.
-7. **Bidirectional relay**: Client ↔ Proxy ↔ DC
+5. In direct mode (`use_middle_proxy = false`), proxy sends 64-byte obfuscated nonce to regular DCs.
+6. If `use_middle_proxy = true` (or `dc=203`), proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
+7. Promotion tag is carried in ME path as `ad_tag` TL block inside `RPC_PROXY_REQ` and in direct path via promo RPC (`0xaeaf0c42` + 16-byte tag).
+8. **Bidirectional relay**: Client ↔ Proxy ↔ DC
    - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
    - **S2C (classic DC)**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
    - **S2C (DC203)**: DC AES-CBC frame → decapsulate `RPC_PROXY_ANS`/`RPC_SIMPLE_ACK` → TLS wrap → Client
@@ -96,8 +96,9 @@ make deploy                                            # Cross-compile + stop + 
 `make deploy` performs the following steps:
 1. Cross-compile for Linux.
 2. `systemctl stop mtproto-proxy`.
-3. `scp` binary to VPS.
-4. `systemctl start mtproto-proxy`.
+3. `scp` binary and deploy scripts to VPS.
+4. If `$(CONFIG)` exists locally, upload it as `/opt/mtproto-proxy/config.toml`.
+5. `systemctl start mtproto-proxy`.
 
 > [!IMPORTANT]
 > You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
@@ -268,6 +269,9 @@ All relay sockets use these settings:
 19. **Split-TLS desync**: Added 1-byte TCP split on ServerHello send to break ТСПУ passive signature matching. Gated by `desync` config flag.
 20. **MiddleProxy DC203 parity fix**: Added complete `middleproxy.zig` path, fixed `RPC_PROXY_REQ` serialization, CBC frame handling, key derivation inputs, and `RPC_HANDSHAKE_ANS` validation.
 21. **MiddleProxy metadata updater**: Added periodic refresh of DC203 proxy endpoint and shared secret from Telegram core endpoints.
+22. **Telemt promo parity**: Added `[general].use_middle_proxy` support for regular DC1..5 and `[general].ad_tag` alias; ME path now injects ad tag into `RPC_PROXY_REQ` when configured.
+23. **Deploy config parity**: `make deploy` now uploads runtime `config.toml` (via `CONFIG`) to `/opt/mtproto-proxy/config.toml` to avoid stale server config after binary-only deploys.
+24. **Production log normalization**: reverted temporary relay diagnostics (`DIAG C2S/S2C`, `Relay ended`, common reset/EOF errors) back to debug level to reduce log I/O noise and keep warning/error logs actionable under high mobile churn.
 
 ---
 
@@ -480,6 +484,10 @@ If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN pr
 - **Testing**: Comprehensive E2E Integration tests + unit tests in `test` blocks at the bottom of `.zig` files. Includes fake localhost TCP servers directly communicating via background loopback sockets.
 - **Logging**: Only `log.info` for essential events; `log.debug` for diagnostics.
 - **No global mutable state**: Always pass `ProxyState` by reference.
+
+### Repository Workflow Rule
+- For every substantial code task, update both `README.md` (sometimes referred to as `REDMI`) and `GEMINI.md` before finalizing, so user-facing docs and engineering notes stay in sync.
+- Agent-facing instruction: treat README/REDMI + GEMINI updates as part of done criteria for feature/fix work, not as optional cleanup.
 
 ---
 

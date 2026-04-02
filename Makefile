@@ -26,6 +26,9 @@ deploy:
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
 	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/
+	-if [ -f $(CONFIG) ]; then \
+		scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; \
+	fi
 	ssh root@$(SERVER) 'chmod +x /opt/mtproto-proxy/*.sh'
 	-if [ -f .env ]; then \
 		awk '{print "export " $$0}' .env > .env.tmp_deploy; \
