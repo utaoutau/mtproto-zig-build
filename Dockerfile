@@ -59,7 +59,5 @@ WORKDIR /etc/mtproto-proxy
 
 COPY config.toml.example /usr/share/doc/mtproto-proxy/config.toml.example
 
-EXPOSE 443/tcp
-
 ENTRYPOINT ["/usr/local/bin/mtproto-proxy"]
 CMD ["/etc/mtproto-proxy/config.toml"]
