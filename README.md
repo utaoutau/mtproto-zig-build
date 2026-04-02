@@ -105,7 +105,7 @@ Automated releases are managed by GitHub Actions and `release-please`.
 1. Merge commits into `main` using Conventional Commit prefixes.
 2. `Release Please` opens or updates a release PR when a version bump is needed.
 3. Merge that release PR to create tag `vX.Y.Z`, update `CHANGELOG.md`, and publish a GitHub release.
-4. `Release Assets` builds Linux binaries and attaches `.tar.gz` artifacts to the published release.
+4. The same `Release Please` workflow builds Linux binaries and attaches `.tar.gz` artifacts when a release is created.
 
 Version bump rules:
 - `fix:` -> patch (`v1.2.3` -> `v1.2.4`)
