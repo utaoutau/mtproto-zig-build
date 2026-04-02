@@ -110,6 +110,7 @@ docker build -t mtproto-zig .
 | Argument       | Default   | Description |
 |----------------|-----------|-------------|
 | `ZIG_VERSION`  | `0.15.2`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
+| `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
 
 Example:
 
@@ -126,7 +127,8 @@ The **builder** stage maps Docker’s auto-injected `TARGETARCH` to Zig’s Linu
 | `amd64`                 | `x86_64`    |
 | `arm64`                 | `aarch64`   |
 
-You normally **do not** pass `TARGETARCH` yourself; BuildKit sets it from the requested platform.
+You normally **do not** pass `TARGETARCH` yourself; BuildKit sets it from the requested platform.  
+If BuildKit auto-args are unavailable, the Dockerfile falls back to host architecture detection.
 
 **Build for a specific CPU architecture** (e.g. from an Apple Silicon Mac to run on an `amd64` VPS):
 
@@ -146,14 +148,16 @@ docker buildx build \
 
 ### Run
 
-Mount your `config.toml` and publish the listen port from the config (example uses `8443` inside the container and maps host `443`):
+Mount your `config.toml` and publish the listen port from the config (default `config.toml.example` uses `443`):
 
 ```bash
 docker run --rm \
-  -p 443:8443 \
+  -p 443:443 \
   -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
   mtproto-zig
 ```
+
+If your config sets `server.port = 8443`, publish `-p 8443:8443` instead.
 
 OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not** applied inside the container; only the proxy binary runs there.
 
