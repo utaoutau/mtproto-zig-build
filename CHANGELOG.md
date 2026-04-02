@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/sleep3r/mtproto.zig/compare/v0.2.0...v0.2.1) (2026-04-02)
+
+
+### Bug Fixes
+
+* respect mask_port for local masking and ignore .vscode ([#24](https://github.com/sleep3r/mtproto.zig/issues/24)) ([b4a5030](https://github.com/sleep3r/mtproto.zig/commit/b4a50303e1035d912bc46c8f61aba75396b64172))
+
 ## [0.2.0](https://github.com/sleep3r/mtproto.zig/compare/v0.1.0...v0.2.0) (2026-04-02)
 
 
