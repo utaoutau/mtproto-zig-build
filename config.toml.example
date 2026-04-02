@@ -1,0 +1,25 @@
+[server]
+port = 443
+# Optional: 32 hex-char promotion tag from @MTProxybot
+# tag = "1234567890abcdef1234567890abcdef"
+
+[censorship]
+# Domain to impersonate / forward bad clients to
+tls_domain = "google.com"
+
+# Forward unauthenticated connections to tls_domain to defeat DPI
+mask = true
+
+# Non-standard port override for masking locally (e.g. 8443 for zero-RTT local Nginx)
+# mask_port = 8443
+
+# TCP desync: split ServerHello into 1-byte + rest to evade passive DPI signatures
+desync = true
+
+# Recommended: Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC
+fast_mode = true
+
+[access.users]
+# 32 hex-char secret (16 bytes) per user. Generate with: openssl rand -hex 16
+user1 = "00112233445566778899aabbccddeeff"
+user2 = "ffeeddccbbaa99887766554433221100"

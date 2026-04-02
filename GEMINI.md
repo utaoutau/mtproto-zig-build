@@ -99,7 +99,8 @@ make deploy                                            # Cross-compile + stop + 
 > [!IMPORTANT]
 > You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
 
-### Configuration (`config.toml`)
+### Configuration (`config.toml.example`)
+Users can copy `config.toml.example` to `config.toml`. The structure natively supports the new anti-DPI routing fields:
 ```toml
 [server]
 port = 443
@@ -108,6 +109,7 @@ tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTPro
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+mask_port = 8443                           # Zero-RTT override
 desync = true                              # TCP desync: split ServerHello (1-byte + rest)
 fast_mode = true
 
