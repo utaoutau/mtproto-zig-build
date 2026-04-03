@@ -149,6 +149,12 @@ pub const ProxyState = struct {
     middle_proxy_addrs_primary: [5]net.Address,
     /// Current middle-proxy endpoint for media DC 203.
     middle_proxy_addr_203: net.Address,
+    /// Candidate middle-proxy endpoints for DC4 (some may be filtered per route).
+    middle_proxy_addrs_dc4: [16]net.Address,
+    middle_proxy_addrs_dc4_len: usize,
+    /// Candidate middle-proxy endpoints for media DC203.
+    middle_proxy_addrs_203: [8]net.Address,
+    middle_proxy_addrs_203_len: usize,
     /// Current middle-proxy shared secret from getProxySecret.
     middle_proxy_secret: [256]u8,
     /// Valid length of middle_proxy_secret bytes.
@@ -198,6 +204,10 @@ pub const ProxyState = struct {
             .replay_cache = .{},
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
+            .middle_proxy_addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
+            .middle_proxy_addrs_dc4_len = 1,
+            .middle_proxy_addrs_203 = [_]net.Address{constants.getDcAddressV4(203)} ++ ([_]net.Address{constants.getDcAddressV4(203)} ** 7),
+            .middle_proxy_addrs_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
         };
@@ -273,6 +283,10 @@ pub const ProxyState = struct {
     const MiddleProxySnapshot = struct {
         addrs_primary: [5]net.Address,
         addr_203: net.Address,
+        addrs_dc4: [16]net.Address,
+        addrs_dc4_len: usize,
+        addrs_203: [8]net.Address,
+        addrs_203_len: usize,
         secret: [256]u8,
         secret_len: usize,
 
@@ -292,6 +306,10 @@ pub const ProxyState = struct {
         return .{
             .addrs_primary = self.middle_proxy_addrs_primary,
             .addr_203 = self.middle_proxy_addr_203,
+            .addrs_dc4 = self.middle_proxy_addrs_dc4,
+            .addrs_dc4_len = self.middle_proxy_addrs_dc4_len,
+            .addrs_203 = self.middle_proxy_addrs_203,
+            .addrs_203_len = self.middle_proxy_addrs_203_len,
             .secret = self.middle_proxy_secret,
             .secret_len = self.middle_proxy_secret_len,
         };
@@ -311,10 +329,40 @@ pub const ProxyState = struct {
         defer self.allocator.free(cfg_bytes);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
+        var next_dc4_candidates: [16]net.Address = undefined;
+        var next_dc4_candidates_len: usize = 0;
         for (0..next_primary.len) |i| {
-            next_primary[i] = parseMiddleProxyAddressForDc(cfg_bytes, @as(i16, @intCast(i + 1)));
+            var candidates: [16]net.Address = undefined;
+            const count = parseMiddleProxyAddressesForDc(cfg_bytes, @as(i16, @intCast(i + 1)), &candidates);
+
+            if (i == 3 and count > 0) {
+                const dc4_n = @min(count, next_dc4_candidates.len);
+                @memcpy(next_dc4_candidates[0..dc4_n], candidates[0..dc4_n]);
+                next_dc4_candidates_len = dc4_n;
+            }
+
+            next_primary[i] = if (count == 0)
+                null
+            else if (i == 3)
+                candidates[0]
+            else if (trySelectReachableMiddleProxy(candidates[0..count], 1200)) |reachable|
+                reachable
+            else
+                candidates[0];
         }
-        const next_addr_203 = parseMiddleProxyAddressForDc(cfg_bytes, 203);
+        var candidates_203: [8]net.Address = undefined;
+        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, &candidates_203);
+        var next_203_candidates: [8]net.Address = undefined;
+        var next_203_candidates_len: usize = 0;
+        if (count_203 > 0) {
+            const c203_n = @min(count_203, next_203_candidates.len);
+            @memcpy(next_203_candidates[0..c203_n], candidates_203[0..c203_n]);
+            next_203_candidates_len = c203_n;
+        }
+        const next_addr_203 = if (count_203 == 0)
+            null
+        else
+            candidates_203[0];
 
         const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
         defer self.allocator.free(next_secret);
@@ -344,6 +392,26 @@ pub const ProxyState = struct {
             }
         }
 
+        if (next_dc4_candidates_len > 0) {
+            if (self.middle_proxy_addrs_dc4_len != next_dc4_candidates_len or
+                !addressesEqual(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]))
+            {
+                @memcpy(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]);
+                self.middle_proxy_addrs_dc4_len = next_dc4_candidates_len;
+                changed = true;
+            }
+        }
+
+        if (next_203_candidates_len > 0) {
+            if (self.middle_proxy_addrs_203_len != next_203_candidates_len or
+                !addressesEqual(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]))
+            {
+                @memcpy(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]);
+                self.middle_proxy_addrs_203_len = next_203_candidates_len;
+                changed = true;
+            }
+        }
+
         if (self.middle_proxy_secret_len != next_secret.len or
             !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
         {
@@ -354,7 +422,8 @@ pub const ProxyState = struct {
         }
 
         if (changed) {
-            log.info("Middle-proxy cache updated: addr={any} secret_len={d}", .{
+            log.info("Middle-proxy cache updated: dc4={any} dc203={any} secret_len={d}", .{
+                self.middle_proxy_addrs_primary[3],
                 self.middle_proxy_addr_203,
                 self.middle_proxy_secret_len,
             });
@@ -363,7 +432,32 @@ pub const ProxyState = struct {
 };
 
 fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
+    var one: [1]net.Address = undefined;
+    const n = parseMiddleProxyAddressesForDc(config_text, target_dc, &one);
+    if (n == 0) return null;
+    return one[0];
+}
+
+fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+
+    if (a.any.family == posix.AF.INET) {
+        return a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port;
+    }
+
+    if (a.any.family == posix.AF.INET6) {
+        return std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and a.in6.sa.port == b.in6.sa.port;
+    }
+
+    return false;
+}
+
+fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: []net.Address) usize {
+    if (out.len == 0) return 0;
+
     var lines = std.mem.splitScalar(u8, config_text, '\n');
+    var count: usize = 0;
+
     while (lines.next()) |raw_line| {
         var line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
         if (line.len == 0 or line[0] == '#') continue;
@@ -380,10 +474,65 @@ fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Ad
         if (dc_idx != target_dc and dc_idx != -target_dc) continue;
 
         const parsed = net.Address.parseIpAndPort(host_port) catch continue;
-        return parsed;
+
+        // Skip duplicates.
+        var dup = false;
+        for (out[0..count]) |existing| {
+            if (existing.eql(parsed)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        out[count] = parsed;
+        count += 1;
+        if (count == out.len) break;
     }
 
+    return count;
+}
+
+fn trySelectReachableMiddleProxy(candidates: []const net.Address, timeout_ms: i32) ?net.Address {
+    for (candidates) |addr| {
+        if (isAddressReachable(addr, timeout_ms)) {
+            return addr;
+        }
+    }
     return null;
+}
+
+fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!lhs.eql(rhs)) return false;
+    }
+    return true;
+}
+
+fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
+    const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const fd = posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP) catch return false;
+    defer posix.close(fd);
+
+    posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {},
+        else => return false,
+    };
+
+    var fds = [_]posix.pollfd{
+        .{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 },
+    };
+
+    const ready = posix.poll(&fds, timeout_ms) catch return false;
+    if (ready == 0) return false;
+
+    const revents = fds[0].revents;
+    if ((revents & posix.POLL.OUT) == 0) return false;
+    if ((revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) return false;
+
+    posix.getsockoptError(fd) catch return false;
+    return true;
 }
 
 fn runCurl(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
@@ -442,6 +591,10 @@ test "middle proxy snapshot selects primary dc and 203" {
     const snapshot = ProxyState.MiddleProxySnapshot{
         .addrs_primary = constants.tg_middle_proxies_v4,
         .addr_203 = constants.getDcAddressV4(203),
+        .addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
+        .addrs_dc4_len = 1,
+        .addrs_203 = [_]net.Address{constants.getDcAddressV4(203)} ++ ([_]net.Address{constants.getDcAddressV4(203)} ** 7),
+        .addrs_203_len = 1,
         .secret = [_]u8{0} ** 256,
         .secret_len = 128,
     };
@@ -516,10 +669,12 @@ fn handleConnectionInner(
     const fd = client_stream.handle;
 
     // Stage 1: wait for first byte (idle pool phase)
+    const first_byte_timeout_ms: i32 = idle_timeout_ms;
+
     var poll_fds = [_]posix.pollfd{
         .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
     };
-    const ready = posix.poll(&poll_fds, idle_timeout_ms) catch return error.ConnectionReset;
+    const ready = posix.poll(&poll_fds, first_byte_timeout_ms) catch return error.ConnectionReset;
     if (ready == 0) {
         // Client held the socket open but never sent data — normal pool behavior.
         return error.IdleConnectionClosed;
@@ -757,26 +912,163 @@ fn handleConnectionInner(
         null;
 
     // Compatibility behavior:
-    // - dc=203 always uses middle-proxy transport when not overridden in tests.
+    // - Media paths (negative DC index, plus legacy media DC203) should prefer
+    //   middle-proxy transport.
     // - [general].use_middle_proxy enables middle-proxy transport for regular DC1..5.
-    const force_media_middle_proxy = (dc_abs == 203 and state.config.datacenter_override == null);
-    const use_middle_proxy_transport = if (state.config.datacenter_override != null)
+    const is_media_path = (params.dc_idx < 0) or (dc_abs == 203);
+    const force_media_middle_proxy = (is_media_path and state.config.datacenter_override == null and middle_proxy_addr != null);
+    var use_middle_proxy_transport = if (state.config.datacenter_override != null)
         false
     else if (force_media_middle_proxy)
         true
     else
         state.config.use_middle_proxy and middle_proxy_addr != null;
 
-    const dc_addr = state.config.datacenter_override orelse if (use_middle_proxy_transport)
+    var dc_addr = state.config.datacenter_override orelse if (use_middle_proxy_transport)
         middle_proxy_addr.?
     else
         constants.getDcAddressV4(dc_abs);
     log.debug("[{d}] ({s}) Connecting to DC {d} (addr: {any})", .{ conn_id, peer_str, params.dc_idx, dc_addr });
 
-    const dc_stream = net.tcpConnectToAddress(dc_addr) catch |err| {
-        log.err("[{d}] ({s}) DC connect failed: {any}", .{ conn_id, peer_str, err });
-        return;
-    };
+    // For DC4 we may have multiple middle-proxy candidates. Rotate per-connection
+    // to avoid sticking to a route-blocked endpoint.
+    var dc4_try_order: [16]net.Address = undefined;
+    var dc4_try_count: usize = 0;
+    var dc4_try_index: usize = 0;
+    if (use_middle_proxy_transport and middle_proxy_snapshot != null and dc_abs == 4) {
+        const snap = middle_proxy_snapshot.?;
+        if (snap.addrs_dc4_len > 0) {
+            var uniq_count: usize = 0;
+            for (snap.addrs_dc4[0..snap.addrs_dc4_len]) |cand| {
+                var dup = false;
+                for (dc4_try_order[0..uniq_count]) |existing| {
+                    if (isSameIpEndpoint(existing, cand)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                dc4_try_order[uniq_count] = cand;
+                uniq_count += 1;
+                if (uniq_count == dc4_try_order.len) break;
+            }
+
+            if (uniq_count > 0) {
+                dc4_try_count = uniq_count;
+                dc_addr = dc4_try_order[0];
+                dc4_try_index = 1;
+            }
+        }
+    }
+
+    var dc203_try_order: [8]net.Address = undefined;
+    var dc203_try_count: usize = 0;
+    var dc203_try_index: usize = 0;
+    if (use_middle_proxy_transport and middle_proxy_snapshot != null and dc_abs == 203) {
+        const snap = middle_proxy_snapshot.?;
+        if (snap.addrs_203_len > 0) {
+            var uniq_count: usize = 0;
+            for (snap.addrs_203[0..snap.addrs_203_len]) |cand| {
+                var dup = false;
+                for (dc203_try_order[0..uniq_count]) |existing| {
+                    if (isSameIpEndpoint(existing, cand)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                dc203_try_order[uniq_count] = cand;
+                uniq_count += 1;
+                if (uniq_count == dc203_try_order.len) break;
+            }
+
+            if (uniq_count > 0) {
+                dc203_try_count = uniq_count;
+                dc_addr = dc203_try_order[0];
+                dc203_try_index = 1;
+            }
+        }
+    }
+
+    var dc_stream: net.Stream = undefined;
+    var dc_last_err: ?anyerror = null;
+    dc_connect: while (true) {
+        if (net.tcpConnectToAddress(dc_addr)) |s| {
+            dc_stream = s;
+            break :dc_connect;
+        } else |err| {
+            dc_last_err = err;
+            if (use_middle_proxy_transport and err == error.ConnectionTimedOut and dc_abs == 4 and dc4_try_index < dc4_try_count) {
+                dc_addr = dc4_try_order[dc4_try_index];
+                dc4_try_index += 1;
+                var next_buf: [64]u8 = undefined;
+                const next_str = formatAddress(dc_addr, &next_buf);
+                log.warn("[{d}] ({s}) DC4 MiddleProxy timeout, retrying candidate {d}/{d}: {s}", .{
+                    conn_id,
+                    peer_str,
+                    dc4_try_index,
+                    dc4_try_count,
+                    next_str,
+                });
+                continue :dc_connect;
+            }
+
+            if (use_middle_proxy_transport and err == error.ConnectionTimedOut and dc_abs == 203 and dc203_try_index < dc203_try_count) {
+                dc_addr = dc203_try_order[dc203_try_index];
+                dc203_try_index += 1;
+                var next_buf: [64]u8 = undefined;
+                const next_str = formatAddress(dc_addr, &next_buf);
+                log.warn("[{d}] ({s}) DC203 MiddleProxy timeout, retrying candidate {d}/{d}: {s}", .{
+                    conn_id,
+                    peer_str,
+                    dc203_try_index,
+                    dc203_try_count,
+                    next_str,
+                });
+                continue :dc_connect;
+            }
+
+            if (use_middle_proxy_transport and dc_abs == 4 and dc4_try_index < dc4_try_count) {
+                dc_addr = dc4_try_order[dc4_try_index];
+                dc4_try_index += 1;
+                continue :dc_connect;
+            }
+
+            if (use_middle_proxy_transport and dc_abs == 203 and dc203_try_index < dc203_try_count) {
+                dc_addr = dc203_try_order[dc203_try_index];
+                dc203_try_index += 1;
+                continue :dc_connect;
+            }
+
+            if (use_middle_proxy_transport and err == error.ConnectionTimedOut and !is_media_path) {
+                const fallback_dc = constants.getDcAddressV4(dc_abs);
+                var fallback_buf: [64]u8 = undefined;
+                const fallback_str = formatAddress(fallback_dc, &fallback_buf);
+                log.warn("[{d}] ({s}) MiddleProxy connect timeout for dc={d}, falling back to direct {s}", .{ conn_id, peer_str, params.dc_idx, fallback_str });
+
+                if (net.tcpConnectToAddress(fallback_dc)) |fallback_stream| {
+                    dc_stream = fallback_stream;
+                    dc_addr = fallback_dc;
+                    use_middle_proxy_transport = false;
+                    break :dc_connect;
+                } else |fallback_err| {
+                    log.err("[{d}] ({s}) Fallback DC connect failed: primary={any} fallback={any}", .{
+                        conn_id, peer_str, err, fallback_err,
+                    });
+                    return;
+                }
+            } else if (use_middle_proxy_transport and is_media_path) {
+                log.warn("[{d}] ({s}) MiddleProxy connect failed for media dc={d}: {any}", .{ conn_id, peer_str, params.dc_idx, err });
+                if (dc_last_err) |last_err| {
+                    log.warn("[{d}] ({s}) Last media upstream error after retries: {any}", .{ conn_id, peer_str, last_err });
+                }
+                return;
+            } else {
+                log.err("[{d}] ({s}) DC connect failed: {any}", .{ conn_id, peer_str, err });
+                return;
+            }
+        }
+    }
     defer dc_stream.close();
 
     const is_primary_dc = (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len);
@@ -1374,15 +1666,39 @@ fn readExact(stream: net.Stream, buf: []u8) !usize {
                 var poll_fds = [_]posix.pollfd{
                     .{ .fd = stream.handle, .events = posix.POLL.IN, .revents = 0 },
                 };
-                const ready = posix.poll(&poll_fds, 30_000) catch return total;
-                if (ready == 0) return total; // timeout
-                if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return total;
+                const ready = posix.poll(&poll_fds, 30_000) catch |poll_err| {
+                    log.info("DIAG: readExact poll failed after {d}/{d}B on fd={d}: {any}", .{ total, buf.len, stream.handle, poll_err });
+                    return total;
+                };
+                if (ready == 0) {
+                    log.info("DIAG: readExact poll timeout after {d}/{d}B on fd={d}", .{ total, buf.len, stream.handle });
+                    return total;
+                }
+
+                const revents = poll_fds[0].revents;
+                if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+                    log.info("DIAG: readExact poll error revents=0x{x} after {d}/{d}B on fd={d}", .{ revents, total, buf.len, stream.handle });
+                    return total;
+                }
+                // POLLIN|POLLHUP is valid: there may still be unread bytes queued.
+                if ((revents & posix.POLL.HUP) != 0 and (revents & posix.POLL.IN) == 0) {
+                    log.info("DIAG: readExact poll hup without input after {d}/{d}B on fd={d}", .{ total, buf.len, stream.handle });
+                    return total;
+                }
                 continue; // retry read
             }
-            if (total > 0) return total;
+            if (total > 0) {
+                log.info("DIAG: readExact aborted on {any} after {d}/{d}B on fd={d}", .{ err, total, buf.len, stream.handle });
+                return total;
+            }
             return err;
         };
-        if (nr == 0) return total;
+        if (nr == 0) {
+            if (total > 0) {
+                log.info("DIAG: readExact EOF after {d}/{d}B on fd={d}", .{ total, buf.len, stream.handle });
+            }
+            return total;
+        }
         total += nr;
     }
     return total;
