@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/sleep3r/mtproto.zig/compare/v0.3.0...v0.3.1) (2026-04-03)
+
+
+### Bug Fixes
+
+* support IPv4-only hosts (no IPv6 required) ([#42](https://github.com/sleep3r/mtproto.zig/issues/42)) ([ca3e563](https://github.com/sleep3r/mtproto.zig/commit/ca3e56362bcf9a4fa6a50d2b872a47d55b79d053)), closes [#39](https://github.com/sleep3r/mtproto.zig/issues/39)
+
 ## [0.3.0](https://github.com/sleep3r/mtproto.zig/compare/v0.2.2...v0.3.0) (2026-04-03)
 
 
