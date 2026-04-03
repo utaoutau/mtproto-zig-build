@@ -8,7 +8,8 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 
 ### Current Status
 - **Mac Telegram Desktop**: Fully working, MB-scale traffic, images loading.
-- **iPhone Telegram**: Fully functional via IPv6. `FAST_MODE` implemented and recommended.
+- **iPhone Telegram**: Functional via IPv6; media reliability improved after MiddleProxy routing fixes.
+- **Ubuntu Telegram Desktop**: Connect path stabilized after reconnect regressions (including post-restart "connecting" hangs).
 - **Stability**: Service previously degraded to 99% CPU within 2 days. Root cause (logging mutexes) found and fixed.
 - **Test Coverage**: 34/34 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows.
 - **Promotion Tag**: Supported. Sends `proxy_ans_tag` (RPC `0xaeaf0c42`) after DC handshake for sponsored channel registration.
@@ -260,6 +261,11 @@ A tight 10s `SO_RCVTIMEO` was previously armed too early. iOS may delay the MTPr
 
 **Fix:** Use a generous 60s timeout during the handshake phase. The 10s timeout is only applied after the full 64-byte handshake is assembled.
 
+### Fragmented ClientHello (Desktop/Android)
+Large Telegram ClientHello records can exceed a single TCP segment. Earlier logic could read only one chunk and drop the connection (`got 1443, expected > 1600`).
+
+**Fix:** `readExact` was hardened to keep reading until target length is assembled, including proper `poll()` retry behavior and short-read diagnostics.
+
 ### TLS Record Sizing (S2C)
 `DynamicRecordSizer` previously ramped record sizes from 1369 to 16384 bytes. Desktop handles this, but it may cause issues on iOS.
 
@@ -292,6 +298,13 @@ All relay sockets use these settings:
   - `https://core.telegram.org/getProxySecret`
 - Runtime updates are protected by `std.Thread.RwLock` and applied per new connection.
 - If fetching fails, bundled defaults remain active.
+
+### MiddleProxy Endpoint Rotation (DC4/DC203)
+- The proxy now parses and stores multiple `proxy_for` candidates for unstable paths (`dc=4`, `dc=203`).
+- Candidate lists are deduplicated by `ip:port` before use.
+- Connection logic rotates through candidates per connection before giving up.
+- For non-media paths, direct-DC fallback remains enabled on timeout to avoid multi-minute connect hangs.
+- For media paths (`dc_idx < 0` and legacy `dc=203`), fallback to direct is disabled by design; only MiddleProxy is used.
 
 ### MiddleProxy C2S Frame Safety
 - `encapsulateSingleMessageC2S` previously built RPC payload in a fixed 64KiB stack buffer.
@@ -328,10 +341,29 @@ All relay sockets use these settings:
 24. **Production log normalization**: reverted temporary relay diagnostics (`DIAG C2S/S2C`, `Relay ended`, common reset/EOF errors) back to debug level to reduce log I/O noise and keep warning/error logs actionable under high mobile churn.
 25. **MiddleProxy C2S overflow fix**: removed fixed 64KiB stack RPC buffer in `encapsulateSingleMessageC2S`, switched to direct write into output buffer with explicit bounds checks.
 26. **Bench/Soak tooling**: added built-in `bench` and multithreaded `soak` runners (`src/bench.zig`, `zig build bench`, `zig build soak`, `make bench`, `make soak`) for repeatable local performance and stability validation.
+27. **ClientHello fragmentation fix**: hardened `readExact` to assemble full TLS records across multiple TCP segments; eliminated `Short read on ClientHello body (got 1443, expected ...)` drops seen on Linux/Windows/Android.
+28. **MiddleProxy candidate rotation**: parse and cache multiple `proxy_for` endpoints for `dc=4` and `dc=203`, deduplicate by `ip:port`, and retry across candidates per connection.
+29. **Reconnect stability tuning**: reverted an experimental short desktop first-byte timeout that caused Ubuntu regressions; kept long two-stage timeout semantics and moved resilience to upstream retry logic.
+30. **Media/non-media routing split**: retain fast direct fallback for non-media timeouts while keeping media paths on MiddleProxy transport to preserve media load behavior.
 
 ---
 
 ## Future Work
+
+### Event-Loop Migration (Scalability Track)
+
+Current architecture is intentionally thread-per-connection because it made protocol correctness and debugging simpler during the stabilization phase (FakeTLS, MTProto handshake assembly, MiddleProxy parity, iOS edge cases).
+
+Next major scalability milestone is migrating relay I/O from per-connection threads to a reactor model (`epoll` on Linux / `kqueue` on BSD/macOS):
+
+1. Extract explicit per-connection state machines (handshake, C2S/S2C relay, timeout lifecycle) independent of thread-local control flow.
+2. Introduce acceptor + worker loops (N workers ~= CPU cores) with non-blocking sockets and centralized readiness polling.
+3. Preserve existing safety behavior: partial read/write handling, backpressure (`POLLOUT`/write readiness), idle/active timeout split, lifetime cap, and replay cache checks.
+4. Validate parity with existing test suite, then add event-loop-specific stress tests (10k+ idle connections, mixed burst traffic).
+
+Expected outcome: significantly lower per-connection memory overhead and higher concurrency on small VPS tiers (especially 1 vCPU / 1 GB RAM), without changing protocol semantics.
+
+Note: buffer downsizing is intentionally deferred until after event-loop migration to avoid coupling two risk-heavy changes in one phase.
 
 ### Local E2E Testing Topology
 Implemented a 100% loopback test capability:
@@ -580,6 +612,12 @@ ssh root@154.59.111.234 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
 
 # Check current active IPv6
 ssh root@154.59.111.234 'cat /tmp/mtproto-ipv6-current'
+
+# Check short-read diagnostics (fragmented ClientHello / partial reads)
+ssh root@154.59.111.234 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep "DIAG: readExact"'
+
+# Check MiddleProxy route instability for media/non-media
+ssh root@154.59.111.234 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "MiddleProxy connect|DC4 MiddleProxy timeout|DC203 MiddleProxy timeout"'
 ```
 
 ### IPv6 Hopping
