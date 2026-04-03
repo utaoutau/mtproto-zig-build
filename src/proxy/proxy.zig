@@ -228,13 +228,29 @@ pub const ProxyState = struct {
             0, // flowinfo
             0, // scope_id
         );
-        var server = try address.listen(.{
+        var ipv6_ok = true;
+        var server = address.listen(.{
             .reuse_address = true,
             .kernel_backlog = @intCast(self.config.backlog),
-        });
+        }) catch |err| blk: {
+            if (err == error.AddressFamilyNotSupported) {
+                ipv6_ok = false;
+                log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
+                const address_v4 = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
+                break :blk try address_v4.listen(.{
+                    .reuse_address = true,
+                    .kernel_backlog = @intCast(self.config.backlog),
+                });
+            }
+            return err;
+        };
         defer server.deinit();
 
-        log.info("Listening on 0.0.0.0:{d}", .{self.config.port});
+        if (ipv6_ok) {
+            log.info("Listening on [::]:{d} (dual-stack)", .{self.config.port});
+        } else {
+            log.info("Listening on 0.0.0.0:{d} (IPv4 only)", .{self.config.port});
+        }
 
         // Keep middle-proxy address/secret in sync with Telegram endpoints.
         // Skip in tests when datacenter is explicitly overridden.
