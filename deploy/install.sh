@@ -147,10 +147,13 @@ fi
 
 if command -v ip6tables &>/dev/null; then
     ip6tables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-    ip6tables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
-    mkdir -p /etc/iptables
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
+    if ip6tables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+        mkdir -p /etc/iptables
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
+    else
+        info "IPv6 TCPMSS skipped (IPv6 may be disabled)"
+    fi
 fi
 
 # ── IPv6 Hopping (Cloudflare API) ───────────────────────────

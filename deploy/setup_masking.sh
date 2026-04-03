@@ -52,7 +52,13 @@ if command -v nginx &>/dev/null; then
 else
     info "Installing Nginx..."
     apt-get update -qq || true
-    apt-get install -y nginx >/dev/null 2>&1
+    
+    # Prevent default nginx IPv6 config from breaking installation on IPv4-only hosts
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    echo "# Empty default" > /etc/nginx/sites-available/default
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    
+    apt-get install -y nginx >/dev/null 2>&1 || true
     ok "Nginx installed"
 fi
 
@@ -136,9 +142,9 @@ if [[ -L /etc/nginx/sites-enabled/default ]]; then
     info "Removed default Nginx site"
 fi
 
-# Test config and reload
+# Test config and reload/restart
 nginx -t 2>/dev/null || fail "Nginx config test failed"
-systemctl reload nginx
+systemctl restart nginx || true
 ok "Nginx configured on 127.0.0.1:${NGINX_PORT}"
 
 # ── Verify Nginx is responding ──────────────────────────────
