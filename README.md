@@ -20,7 +20,6 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [Features](#-features) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
 [Update](#-update-existing-server) &nbsp;&bull;&nbsp;
-[Benchmark Snapshot](#-benchmark-snapshot) &nbsp;&bull;&nbsp;
 [Docker](#docker-image) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
