@@ -96,7 +96,7 @@ Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 
 | Proxy | Max observed ESTABLISHED | Max fully stable target* | RSS at peak target |
 |-------|---------------------------|---------------------------|--------------------|
-| **mtproto.zig (pre-tuning)** | 2,000 | 2,000 | 31.5 MB |
+| **mtproto.zig** | 12,000 | 12,000 | 144.3 MB |
 | Official MTProxy | 12,000 | 12,000 | 72.4 MB |
 | Teleproxy | 12,000 | 12,000 | 76.1 MB |
 | Telemt | 8,000 | 8,000 | 50.7 MB |
