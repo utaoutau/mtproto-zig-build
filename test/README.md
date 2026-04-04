@@ -1,50 +1,47 @@
 # Test Utilities
 
+This directory contains lightweight tools used for local and remote validation.
+
+- `capacity_connections_probe.py`: concurrent connection capacity sweeps
+- `connection_stability_check.py`: long-running stability harness
+
 ## Capacity Probe
 
 `capacity_connections_probe.py` estimates how many concurrent TCP sessions each implementation can hold on one host.
 
 ### What it measures
 
-- held concurrent sockets (`ESTABLISHED` on server side)
-- process-tree RSS while those sockets are held
+- server-side held sockets (`ESTABLISHED`)
+- process-tree memory (`RSS`) while sockets are held
 
-This is a **capacity snapshot**, not full real-user throughput under Telegram traffic mix.
+This is a capacity snapshot, not a full Telegram real-user throughput benchmark.
 
-### Prerequisites
+## Environment
 
-- Linux host with `ss` command (`iproute2`)
+- Linux host with `ss` (`iproute2`)
 - Python 3.10+
 - benchmark workspace prepared under `/root/benchmarks` (default)
 
-### Typical usage
+## Quick Start
 
 ```bash
-# list available profiles
+# list profiles
 python3 test/capacity_connections_probe.py --list-profiles
 
-# full sweep with best-effort local tuning
-sudo -E python3 test/capacity_connections_probe.py --profile all --sysctl-tune
-
-# single implementation
+# run one profile with defaults
 sudo -E python3 test/capacity_connections_probe.py --profile mtproto.zig
 
-# custom levels / budget / nofile
-sudo -E python3 test/capacity_connections_probe.py \
-  --profile mtproto.zig \
-  --levels 500,1000,2000,4000,8000 \
-  --open-budget-sec 12 \
-  --nofile 300000 \
-  --nproc 12000
+# full sweep for all configured profiles
+sudo -E python3 test/capacity_connections_probe.py --profile all --sysctl-tune
 ```
 
-### Recommended mtproto.zig profiles
+## Recommended mtproto.zig runs
 
 ```bash
-# "safe" profile for this VPS
+# baseline profile (safe, production-like)
 sudo -E python3 test/capacity_connections_probe.py \
   --profile mtproto.zig \
-  --levels 2000,3000,3500,4000,4500 \
+  --levels 2000,3000,3500,4000,4500,5000 \
   --open-budget-sec 16 \
   --hold-seconds 0.8 \
   --settle-seconds 1.0 \
@@ -52,18 +49,7 @@ sudo -E python3 test/capacity_connections_probe.py \
   --nofile 200000 \
   --nproc 12000
 
-# "stress" profile (checks post-4.5k behavior)
-sudo -E python3 test/capacity_connections_probe.py \
-  --profile mtproto.zig \
-  --levels 4000,4500,5000,5500,6000 \
-  --open-budget-sec 18 \
-  --hold-seconds 0.8 \
-  --settle-seconds 1.0 \
-  --connect-timeout-sec 0.1 \
-  --nofile 250000 \
-  --nproc 12000
-
-# high-capacity profile (host/perf ceiling discovery)
+# high-capacity profile (find host ceiling)
 sudo -E python3 test/capacity_connections_probe.py \
   --profile mtproto.zig \
   --levels 6000,8000,10000,12000 \
@@ -73,78 +59,75 @@ sudo -E python3 test/capacity_connections_probe.py \
   --connect-timeout-sec 0.1 \
   --nofile 300000 \
   --nproc 20000
+
+# explicit ceiling probe
+sudo -E python3 test/capacity_connections_probe.py \
+  --profile mtproto.zig \
+  --levels 13000,14000 \
+  --open-budget-sec 26 \
+  --hold-seconds 0.8 \
+  --settle-seconds 1.0 \
+  --connect-timeout-sec 0.1 \
+  --nofile 350000 \
+  --nproc 20000
 ```
 
-For `mtproto.zig`, the probe now auto-raises `max_connections` in the benchmark config
-above the requested `--levels`, so results reflect runtime/host capacity instead of
-being clipped by config.
+For `mtproto.zig`, the probe auto-raises `max_connections` in benchmark config above requested `--levels`.
+This prevents config clipping and reflects runtime and host limits.
 
-### Output
+## Output
 
-By default, JSON is written to `/root/benchmarks/results/`:
+Default output directory: `/root/benchmarks/results/`
 
-- multi-profile: `capacity_connections.json`
-- single-profile: `capacity_connections_<profile>.json`
+- single profile: `capacity_connections_<profile>.json`
+- multi profile: `capacity_connections.json`
 
-Each profile result includes:
+Each result includes:
 
 - `max_established_observed`
-- `max_stable_target` (stable when `established >= target * stable_ratio`)
-- per-level `rss_kb`, client-side successes, failures
+- `max_stable_target` (`established >= target * stable_ratio`)
+- per-level `connected_client_side`, `established_server_side`, `rss_kb`, `failures`
 
-### Current snapshot (`38.180.236.207`, 1 vCPU / 1 GB)
+## Latest Snapshot (2026-04-04)
 
-| Proxy | Max observed ESTABLISHED | Max fully stable target* | RSS at peak target |
-|-------|---------------------------|---------------------------|--------------------|
-| **mtproto.zig** | 2,000 | 2,000 | 31.5 MB |
-| Official MTProxy | 12,000 | 12,000 | 72.4 MB |
-| Teleproxy | 12,000 | 12,000 | 76.1 MB |
-| Telemt | 8,000 | 8,000 | 50.7 MB |
-| mtg | 8,172 | 4,000 | 124.0 MB |
-| mtprotoproxy | 8,000 | 8,000 | 92.0 MB |
-| mtproto_proxy | 2,000 | 2,000 | 138.7 MB |
+Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 
-### Tuned mtproto.zig snapshot (same VPS)
+### Stable baseline
 
-Applied runtime config:
+Baseline sweep (`2000..5000`) shows:
 
-```toml
-[server]
-max_connections = 4500
-thread_stack_kb = 128
-idle_timeout_sec = 300
-handshake_timeout_sec = 30
-backlog = 8192
-```
+- stable through `5000/5000`
+- no connection failures in probe client
+- memory scales near-linearly with held sockets
 
-Probe result (`--levels 2000,3000,3500,4000,4500,5000`):
+### High-capacity sweeps
 
-- `max_established_observed`: **4517**
-- `max_stable_target`: **4500**
-- RSS at stable 4500 target: **72.5 MB**
-- at target 5000: accepted on client side, but only ~4517 reached `ESTABLISHED`
+- `6000,8000,10000,12000`: all stable (`12000/12000`)
+- `13000,14000`: `13000` stable, `14000` unstable (`~7371` established)
 
-### Updated tuned snapshot (same VPS, stable baseline)
+Practical ceiling on this host/profile: about 13k held sockets.
 
-With stack-safe runtime changes and capacity probe auto-lifting `max_connections`:
+### Memory growth (mtproto.zig)
 
-- levels `2000..5000`: stable through **5000** (`5000/5000` established)
-- levels `6000,7000,8000`: stable through **8000**
-- levels `9000,10000,11000,12000`: stable through **12000**
-- upper sweep `13000,14000` (with explicit high cap):
-  - **13000 stable**
-  - **14000 unstable** (about `7371` established)
+| Held sockets | RSS |
+|--------------|-----|
+| 5000 | 60.6 MB |
+| 8000 | 96.5 MB |
+| 10000 | 120.5 MB |
+| 12000 | 144.3 MB |
 
-So current practical ceiling on this host/profile is around **13k concurrent held sockets**.
+Observed slope is roughly +12 MB per additional 1000 held sockets on this VPS.
 
-\* "Fully stable target" means `established_server_side == target` at that level.
+## Tuning Notes
 
-### Notes for tuning mtproto.zig
+Primary bottlenecks are, in order:
 
-Primary bottlenecks on this VPS are config cap (`max_connections`) first, then host thread/process budget and memory pressure.
-To push higher safely:
+1. config cap (`max_connections`)
+2. host process/thread limits (`ulimit -u`, cgroup `pids.max`)
+3. available memory
 
-- host limits (`ulimit -u`, cgroup `pids.max`)
-- `[server].thread_stack_kb`
+When pushing higher, tune these together:
+
 - `[server].max_connections`
-- probe launcher `--nofile`, `--nproc`, and optional `--sysctl-tune`
+- `[server].thread_stack_kb`
+- probe flags `--nofile` and `--nproc`
