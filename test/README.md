@@ -92,7 +92,19 @@ Each result includes:
 
 Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 
-### Stable baseline
+### Cross-proxy snapshot (baseline run)
+
+| Proxy | Max observed ESTABLISHED | Max fully stable target* | RSS at peak target |
+|-------|---------------------------|---------------------------|--------------------|
+| **mtproto.zig (pre-tuning)** | 2,000 | 2,000 | 31.5 MB |
+| Official MTProxy | 12,000 | 12,000 | 72.4 MB |
+| Teleproxy | 12,000 | 12,000 | 76.1 MB |
+| Telemt | 8,000 | 8,000 | 50.7 MB |
+| mtg | 8,172 | 4,000 | 124.0 MB |
+| mtprotoproxy | 8,000 | 8,000 | 92.0 MB |
+| mtproto_proxy | 2,000 | 2,000 | 138.7 MB |
+
+### mtproto.zig tuned snapshot (latest)
 
 Baseline sweep (`2000..5000`) shows:
 
@@ -117,6 +129,8 @@ Practical ceiling on this host/profile: about 13k held sockets.
 | 12000 | 144.3 MB |
 
 Observed slope is roughly +12 MB per additional 1000 held sockets on this VPS.
+
+\* "Fully stable target" means `established_server_side == target` at that level.
 
 ## Tuning Notes
 

@@ -68,8 +68,10 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ### Connection Capacity (same benchmark host)
 
-- Stable through **12,000** held concurrent sockets (`ESTABLISHED`).
-- Practical ceiling around **13,000** on this 1 vCPU / 1 GB VPS profile.
+| Metric | Value |
+|--------|-------|
+| Stable held connections | **12,000** |
+| Practical ceiling | **~13,000** |
 
 Memory growth while holding connections (mtproto.zig RSS):
 
