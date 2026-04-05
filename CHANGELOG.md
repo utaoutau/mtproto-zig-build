@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.6.0](https://github.com/sleep3r/mtproto.zig/compare/v0.5.1...v0.6.0) (2026-04-05)
+
+Architectural rewrite: single-threaded Linux `epoll` event loop replaces the thread-per-connection model.
+
+### Features
+
+* **proxy:** epoll event loop with pre-allocated connection pool and non-blocking state machine ([#61](https://github.com/sleep3r/mtproto.zig/issues/61)) ([1833855](https://github.com/sleep3r/mtproto.zig/commit/1833855))
+* **proxy:** slab-based `MessageQueue` buffer pooling with tiered block sizes (tiny/small/standard)
+* **proxy:** on-demand heap allocation for idle connections — sub-1 MB baseline RSS
+* **proxy:** `writev` scatter-gather I/O for zero-copy relay writes
+* **proxy:** DRS (Dynamic Record Sizing) — TLS records ramp 1,369 → 16,384 bytes mimicking Chrome/Firefox
+* **proxy:** Zero-RTT cloaking with local Nginx for active probe timing analysis defeat
+* print startup capacity estimate for connection limits ([#58](https://github.com/sleep3r/mtproto.zig/issues/58)) ([6155609](https://github.com/sleep3r/mtproto.zig/commit/615560909b398a11d55d053647bb5a066a0590e9))
+* IPv6 AAAA troubleshooting docs for iOS connect delays
+* client behavior matrix skill for platform debugging
+
+### Performance Improvements
+
+* **memory:** 8.8 MB RSS at 2,000 active TLS-auth connections (~90% less than Go/Rust alternatives)
+* **memory:** 49 MB RSS at 12,000 idle held sockets (1.5–2.5× less than C implementations)
+* **binary:** 177 KB static binary, zero external dependencies
+
 ## [0.5.1](https://github.com/sleep3r/mtproto.zig/compare/v0.5.0...v0.5.1) (2026-04-04)
 
 
