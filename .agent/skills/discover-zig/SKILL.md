@@ -1,6 +1,6 @@
 ---
 name: discover-zig
-description: Router skill for Zig-related tasks in this repository; points to local architecture and gotchas skills.
+description: Router skill for Zig-related tasks in this repository; points to local architecture, gotchas, and client-behavior skills.
 ---
 
 # Zig Skill Router
@@ -24,6 +24,10 @@ Read ../architecture/SKILL.md
 For implementation pitfalls and invariants:
 
 Read ../zig-gotchas/SKILL.md
+
+For platform-specific Telegram client timeout/retry behavior:
+
+Read ../client-behavior/SKILL.md
 
 ## Repository-Specific Notes
 
