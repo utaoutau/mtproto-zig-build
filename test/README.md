@@ -1,147 +1,166 @@
-# Test Utilities
+# Bench & Validation Guide
 
-This directory contains lightweight tools used for local and remote validation.
+This folder contains practical tools to validate **capacity**, **stability**, and **memory behavior** of `mtproto.zig` and reference implementations.
 
-- `capacity_connections_probe.py`: concurrent connection capacity sweeps
-- `connection_stability_check.py`: long-running stability harness
+## Tools
 
-## Capacity Probe
+- `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.
+- `connection_stability_check.py` — churn + idle-pool stability harness (leak/regression detector).
 
-`capacity_connections_probe.py` estimates how many concurrent TCP sessions each implementation can hold on one host.
+## What We Measure
 
-### What it measures
+The capacity probe reports, per target level:
 
-- server-side held sockets (`ESTABLISHED`)
-- process-tree memory (`RSS`) while sockets are held
+- `connect_ok` — successful TCP connect attempts from the probe client.
+- `payload_ok` — successful payload submission for selected traffic mode.
+- `established_server_side` — server-side held `ESTABLISHED` sockets.
+- `rss_kb` — process-tree RSS (listener process + children).
+- `stable` — level considered stable per probe criteria.
 
-This is a capacity snapshot, not a full Telegram real-user throughput benchmark.
+This is a capacity/memory harness, not an end-user Telegram UX benchmark.
+
+## Traffic Modes
+
+- `idle`
+  - Connect and hold sockets without payload.
+  - Best for FD/socket ceilings and idle memory.
+- `tls-auth`
+  - Sends MTProto TLS-auth ClientHello with valid SNI and digest layout.
+  - Best for apples-to-apples active auth memory comparison.
+- `tls-auth-full`
+  - Same as `tls-auth`, plus checks proxy response framing (`ServerHello + CCS + AppData` header sequence).
+  - Best for strict handshake sanity smoke checks.
+- `tls-clienthello`
+  - Sends realistic TLS ClientHello synthesized via Python `ssl` with SNI.
+  - Useful for strict parser/masking behavior checks.
 
 ## Environment
 
-- Linux host with `ss` (`iproute2`)
-- Python 3.10+
-- benchmark workspace prepared under `/root/benchmarks` (default)
+- Linux host with `/proc` and `ss` (`iproute2`).
+- Python 3.10+.
+- Benchmark workspace ready under `/root/benchmarks` (default layout).
 
 ## Quick Start
 
 ```bash
-# list profiles
+# Show available profiles
 python3 test/capacity_connections_probe.py --list-profiles
 
-# run one profile with defaults
+# Single profile, default mode (idle)
 sudo -E python3 test/capacity_connections_probe.py --profile mtproto.zig
 
-# full sweep for all configured profiles
+# Full matrix run
 sudo -E python3 test/capacity_connections_probe.py --profile all --sysctl-tune
 ```
 
-## Recommended mtproto.zig runs
+## Recommended Runs
+
+### 1) Final cross-proxy TLS-auth comparison
 
 ```bash
-# baseline profile (safe, production-like)
 sudo -E python3 test/capacity_connections_probe.py \
-  --profile mtproto.zig \
-  --levels 2000,3000,3500,4000,4500,5000 \
-  --open-budget-sec 16 \
+  --profile all \
+  --traffic-mode tls-auth \
+  --tls-domain google.com \
+  --levels 500,1000,1500,2000 \
+  --open-budget-sec 14 \
   --hold-seconds 0.8 \
   --settle-seconds 1.0 \
   --connect-timeout-sec 0.1 \
   --nofile 200000 \
-  --nproc 12000
+  --nproc 12000 \
+  --output /root/benchmarks/results/capacity_connections_tls_auth.final_all.json
+```
 
-# high-capacity profile (find host ceiling)
+### 2) Final cross-proxy idle comparison
+
+```bash
 sudo -E python3 test/capacity_connections_probe.py \
-  --profile mtproto.zig \
-  --levels 6000,8000,10000,12000 \
+  --profile all \
+  --traffic-mode idle \
+  --levels 4000,8000,12000 \
   --open-budget-sec 24 \
   --hold-seconds 0.8 \
   --settle-seconds 1.0 \
   --connect-timeout-sec 0.1 \
   --nofile 300000 \
-  --nproc 20000
-
-# explicit ceiling probe
-sudo -E python3 test/capacity_connections_probe.py \
-  --profile mtproto.zig \
-  --levels 13000,14000 \
-  --open-budget-sec 26 \
-  --hold-seconds 0.8 \
-  --settle-seconds 1.0 \
-  --connect-timeout-sec 0.1 \
-  --nofile 350000 \
-  --nproc 20000
+  --nproc 20000 \
+  --output /root/benchmarks/results/capacity_connections_idle.final_all.json
 ```
 
-For `mtproto.zig`, the probe auto-raises `max_connections` in benchmark config above requested `--levels`.
-This prevents config clipping and reflects runtime and host limits.
+### 3) Strict handshake smoke (`tls-auth-full`)
 
-## Output
+```bash
+sudo -E python3 test/capacity_connections_probe.py \
+  --profile mtproto.zig \
+  --traffic-mode tls-auth-full \
+  --tls-domain google.com \
+  --levels 100,200 \
+  --open-budget-sec 8 \
+  --hold-seconds 0.5 \
+  --settle-seconds 0.8 \
+  --connect-timeout-sec 0.1 \
+  --nofile 200000 \
+  --nproc 12000 \
+  --output /root/benchmarks/results/capacity_connections_mtproto_zig.tls_auth_full_smoke_v2.json
+```
 
-Default output directory: `/root/benchmarks/results/`
-
-- single profile: `capacity_connections_<profile>.json`
-- multi profile: `capacity_connections.json`
-
-Each result includes:
-
-- `max_established_observed`
-- `max_stable_target` (`established >= target * stable_ratio`)
-- per-level `connected_client_side`, `established_server_side`, `rss_kb`, `failures`
-
-## Latest Snapshot (2026-04-04)
+## Final Snapshot (Current)
 
 Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 
-### Cross-proxy snapshot (baseline run)
+### TLS-auth @ 2000
 
-| Proxy | Max observed ESTABLISHED | Max fully stable target* | RSS at peak target |
-|-------|---------------------------|---------------------------|--------------------|
-| **mtproto.zig** | 12,000 | 12,000 | 144.3 MB |
-| Official MTProxy | 12,000 | 12,000 | 72.4 MB |
-| Teleproxy | 12,000 | 12,000 | 76.1 MB |
-| Telemt | 8,000 | 8,000 | 50.7 MB |
-| mtg | 8,172 | 4,000 | 124.0 MB |
-| mtprotoproxy | 8,000 | 8,000 | 92.0 MB |
-| mtproto_proxy | 2,000 | 2,000 | 138.7 MB |
+| Proxy | RSS (KB) | Established | Stable |
+|---|---:|---:|---|
+| **mtproto.zig** | **8,832** | **2,000** | ✅ |
+| Official MTProxy | 23,296 | 2,000 | ✅ |
+| Teleproxy | 21,024 | 2,000 | ✅ |
+| Telemt | startup_failed | - | - |
+| mtg | 72,192 | 0 | ❌ |
+| mtprotoproxy | 50,944 | 2,000 | ✅ |
+| mtproto_proxy | startup_failed | - | - |
 
-### mtproto.zig tuned snapshot (latest)
+`mtproto.zig` vs historical baseline (`84,544 KB`): **-89.55% RSS** at 2000.
 
-Baseline sweep (`2000..5000`) shows:
+### Idle @ 12000
 
-- stable through `5000/5000`
-- no connection failures in probe client
-- memory scales near-linearly with held sockets
+| Proxy | RSS (KB) | Established | Stable |
+|---|---:|---:|---|
+| **mtproto.zig** | **49,024** | **12,000** | ✅ |
+| Official MTProxy | 74,224 | 12,000 | ✅ |
+| Teleproxy | 77,964 | 12,000 | ✅ |
+| Telemt | 70,108 | 11,023 | ❌ |
+| mtg | 106,368 | 7,339 | ❌ |
+| mtprotoproxy | 115,888 | 9,088 | ❌ |
+| mtproto_proxy | startup_failed | - | - |
 
-### High-capacity sweeps
+## Interpreting Results Correctly
 
-- `6000,8000,10000,12000`: all stable (`12000/12000`)
-- `13000,14000`: `13000` stable, `14000` unstable (`~7371` established)
+- Compare proxies at the **same target level**.
+- Prefer **total RSS at level** over only delta-per-conn.
+- Watch both `payload_ok` and `established_server_side`.
+- For strict parser checks, use `tls-auth-full` or `tls-clienthello`.
 
-Practical ceiling on this host/profile: about 13k held sockets.
+## Stability Harness
 
-### Memory growth (mtproto.zig)
+`connection_stability_check.py` is useful for leak-like regressions after churn and idle pressure.
 
-| Held sockets | RSS |
-|--------------|-----|
-| 5000 | 60.6 MB |
-| 8000 | 96.5 MB |
-| 10000 | 120.5 MB |
-| 12000 | 144.3 MB |
+Example:
 
-Observed slope is roughly +12 MB per additional 1000 held sockets on this VPS.
+```bash
+python3 test/connection_stability_check.py \
+  --host 127.0.0.1 --port 443 --pid <proxy_pid> \
+  --idle-connections 6000 --idle-cycles 3 \
+  --churn-total 30000 --churn-concurrency 300
+```
 
-\* "Fully stable target" means `established_server_side == target` at that level.
+## Practical Tuning Notes
 
-## Tuning Notes
+Primary bottlenecks typically are:
 
-Primary bottlenecks are, in order:
+1. `max_connections` runtime cap.
+2. Host FD limits (`ulimit -n`, systemd `LimitNOFILE`).
+3. Available RAM.
 
-1. config cap (`max_connections`)
-2. host process/thread limits (`ulimit -u`, cgroup `pids.max`)
-3. available memory
-
-When pushing higher, tune these together:
-
-- `[server].max_connections`
-- `[server].thread_stack_kb`
-- probe flags `--nofile` and `--nproc`
+When pushing higher levels, tune config and probe limits together.
