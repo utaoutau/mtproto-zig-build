@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sleep3r/mtproto.zig/compare/v0.5.1...v0.6.0) (2026-04-05)
+
+
+### Features
+
+* print startup capacity estimate for connection limits ([#58](https://github.com/sleep3r/mtproto.zig/issues/58)) ([6155609](https://github.com/sleep3r/mtproto.zig/commit/615560909b398a11d55d053647bb5a066a0590e9))
+
 ## [0.5.1](https://github.com/sleep3r/mtproto.zig/compare/v0.5.0...v0.5.1) (2026-04-04)
 
 
