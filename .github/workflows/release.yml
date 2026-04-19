@@ -1,0 +1,96 @@
+name: mtproto-zig-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 3.0.1)'
+        required: true
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact_name: mtproto-proxy-linux-x86_64
+            binary: mtproto-proxy
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtproto-proxy-linux-x86_64_v3
+            binary: mtproto-proxy
+            cpu: x86_64_v3+aes
+          - target: aarch64-linux
+            artifact_name: mtproto-proxy-linux-aarch64
+            binary: mtproto-proxy
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtbuddy-linux-x86_64
+            binary: mtbuddy
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtbuddy-linux-x86_64_v3
+            binary: mtbuddy
+            cpu: x86_64_v3+aes
+          - target: aarch64-linux
+            artifact_name: mtbuddy-linux-aarch64
+            binary: mtbuddy
+            cpu: ""
+
+    steps:
+      - name: Checkout mtproto.zig Source Code
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+          path: ./
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Verify AES-enabled x86_64_v3 profile
+        if: contains(matrix.cpu, 'x86_64_v3')
+        run: |
+          cat > /tmp/check_aes_target.zig <<'EOF'
+          const std = @import("std");
+
+          comptime {
+              if (!std.crypto.core.aes.has_hardware_support) {
+                  @compileError("x86_64_v3 release artifacts must be built with +aes");
+              }
+          }
+
+          pub fn main() void {}
+          EOF
+          zig build-exe -target "${{ matrix.target }}" -mcpu "${{ matrix.cpu }}" /tmp/check_aes_target.zig
+
+      - name: Build release binary
+        run: |
+          BUILD_ARGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
+          if [ -n "${{ matrix.cpu }}" ]; then
+            BUILD_ARGS="$BUILD_ARGS -Dcpu=${{ matrix.cpu }}"
+          fi
+          zig build $BUILD_ARGS
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/${{ matrix.binary }} dist/${{ matrix.binary }}
+          chmod +x dist/${{ matrix.binary }}
+          tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz ${{ matrix.binary }}
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ github.token }}
+          file: ${{ github.workspace }}/dist/${{ matrix.artifact_name }}.tar.gz
+          tag: v${{ github.event.inputs.version }}
+          file_glob: true
+          release_name: 'Release mtproto.zig ${{ github.event.inputs.version }}'
+          overwrite: true
+          prerelease: false
+          body: 'mtproto.zig, built `${{ github.event.inputs.version }}`.'
