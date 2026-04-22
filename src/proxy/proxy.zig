@@ -1880,7 +1880,25 @@ const EventLoop = struct {
 
         const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
 
-        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{}", .{
+        // Build per-user active connection counts for dashboard parsing
+        var user_buf: [1024]u8 = undefined;
+        var user_pos: usize = 0;
+        var users_active_total: u32 = 0;
+        for (self.state.user_metrics) |*um| {
+            const uactive = um.connections_active.load(.monotonic);
+            users_active_total +|= uactive;
+            const name = um.name;
+            if (user_pos > 0 and user_pos < user_buf.len) {
+                user_buf[user_pos] = ',';
+                user_pos += 1;
+            }
+            const written = std.fmt.bufPrint(user_buf[user_pos..], "{s}={d}", .{ name, uactive }) catch break;
+            user_pos += written.len;
+        }
+        const user_str = if (user_pos > 0) user_buf[0..user_pos] else "";
+        const unassigned_active = active -| users_active_total;
+
+        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{} users_total={d} unassigned={d} users{{{s}}}", .{
             active,
             self.state.config.max_connections,
             hs,
@@ -1890,6 +1908,9 @@ const EventLoop = struct {
             accepted_total,
             self.accept_paused,
             self.saturation_paused,
+            users_active_total,
+            unassigned_active,
+            user_str,
         });
 
         if (has_drops) {
@@ -3876,14 +3897,14 @@ const EventLoop = struct {
             slot.upstream_fd = -1;
         }
 
+        const user_metrics = slot.user_metrics;
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
             _ = self.state.closed_count.fetchAdd(1, .monotonic);
-            if (slot.user_metrics) |entry| {
+            if (user_metrics) |entry| {
                 _ = entry.connections_active.fetchSub(1, .monotonic);
-                slot.user_metrics = null;
             }
             // If connection was still in handshake phase, release from handshake budget
             if (slot.handshakeInProgress()) {
